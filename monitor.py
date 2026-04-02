@@ -8,7 +8,7 @@ from email.mime.text import MIMEText
 from datetime import datetime
 
 # ── Configuración ──────────────────────────────────────────────────────────────
-URL = "https://www.uniqlo.com/es/es/spl/pickup-items"
+URL = "https://www.uniqlo.com/es/es/feature/sale/men/"
 STATE_FILE = "state.json"
 
 GMAIL_USER   = os.environ["GMAIL_USER"]    # tu correo Gmail
