@@ -5,7 +5,7 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
-from patchright.sync_api import sync_playwright  # ← cambiado de playwright a patchright
+from patchright.sync_api import sync_playwright
 
 # ── Configuración ──────────────────────────────────────────────────────────────
 URL = "https://www.uniqlo.com/es/es/feature/sale/men/"
@@ -42,33 +42,40 @@ def fetch_product_ids() -> list[str]:
         page = context.new_page()
 
         # Primero visitar la home para obtener cookies
+        print("  -> Cargando home...")
         page.goto("https://www.uniqlo.com/es/es/", wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2000)
 
         # Ahora la página de ofertas
+        print("  -> Cargando página de ofertas...")
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)
+
+        # Esperar activamente a que __NEXT_DATA__ aparezca en el DOM.
+        # Esto cubre el tiempo que tarda Akamai en resolver el challenge
+        # y Next.js en inyectar los datos (puede tardar varios segundos).
+        print("  -> Esperando __NEXT_DATA__...")
+        try:
+            page.wait_for_function(
+                "() => document.getElementById('__NEXT_DATA__') !== null",
+                timeout=30000
+            )
+            print("  -> __NEXT_DATA__ detectado en el DOM")
+        except Exception:
+            # Si no aparece en 30s, volcamos el HTML para diagnóstico
+            html = page.content()
+            browser.close()
+            print("=== HTML SNIPPET (primeros 2000 chars) ===")
+            print(html[:2000])
+            print("=== FIN SNIPPET ===")
+            raise ValueError("__NEXT_DATA__ no apareció en 30 segundos — Akamai sigue bloqueando")
 
         html = page.content()
         browser.close()
 
-    # ── DEBUG: diagnóstico (puedes eliminar este bloque una vez que funcione) ──
-    has_next_data = 'id="__NEXT_DATA__"' in html
-    has_akamai    = 'elgnisolqinu' in html or '_abck' in html
-    print(f"  __NEXT_DATA__ presente: {has_next_data}")
-    print(f"  Challenge Akamai detectado: {has_akamai}")
-    if not has_next_data:
-        print("=== HTML SNIPPET (primeros 1500 chars) ===")
-        print(html[:1500])
-        print("=== FIN SNIPPET ===")
-        raise ValueError("Página no cargada correctamente — posible challenge Akamai")
-    # ──────────────────────────────────────────────────────────────────────────
-
     # Extraer __NEXT_DATA__
     match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
     if not match:
-        snippet = html[:800].replace("\n", " ")
-        raise ValueError(f"No se encontró __NEXT_DATA__. HTML recibido: {snippet}")
+        raise ValueError("__NEXT_DATA__ presente en DOM pero no extraíble con regex")
 
     data = json.loads(match.group(1))
 
