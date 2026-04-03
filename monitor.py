@@ -48,7 +48,6 @@ def fetch_product_ids() -> list[str]:
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(5000)
 
-        # Scroll incremental para que todos los productos se rendericen en el DOM
         print("  -> Scrolleando para renderizar todos los productos...")
         VIEWPORT_HEIGHT = 1080
         STEP = VIEWPORT_HEIGHT
@@ -71,30 +70,37 @@ def fetch_product_ids() -> list[str]:
         else:
             print("  -> Límite de pasos alcanzado.")
 
-        # Leer el DOM una sola vez, con todos los productos ya renderizados
         print("  -> Extrayendo IDs del DOM...")
-        dom_ids = page.evaluate("""
+        result = page.evaluate("""
             () => {
                 const links = document.querySelectorAll('a[href*="/products/"]');
                 const ids = new Set();
+                const noMatch = new Set();
                 links.forEach(a => {
                     const m = a.href.match(/\\/products\\/(E\\d+-\\d+)/);
-                    if (m) ids.add(m[1]);
+                    if (m) {
+                        ids.add(m[1]);
+                    } else {
+                        noMatch.add(a.href);
+                    }
                 });
-                return Array.from(ids);
+                return { ids: Array.from(ids), noMatch: Array.from(noMatch).slice(0, 30) };
             }
         """)
 
+        print(f"  -> {len(result['ids'])} productos encontrados con regex actual")
+        print(f"  -> {len(result['noMatch'])} links /products/ que NO coinciden con regex:")
+        for href in result["noMatch"]:
+            print(f"     {href}")
+
         browser.close()
 
-    print(f"  -> {len(dom_ids)} productos únicos extraídos del DOM")
+    dom_ids = result["ids"]
 
     if not dom_ids:
-        raise ValueError(
-            "No se encontró ningún producto en el DOM. "
-            "La página puede haber cambiado de estructura."
-        )
+        raise ValueError("No se encontró ningún producto en el DOM.")
 
+    print(f"  -> Total: {len(dom_ids)} productos únicos")
     return dom_ids
 
 
