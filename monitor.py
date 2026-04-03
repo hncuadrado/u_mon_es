@@ -1,6 +1,5 @@
 import os
 import json
-import re
 import smtplib
 from urllib.parse import urlparse, parse_qs
 from email.mime.multipart import MIMEMultipart
@@ -19,10 +18,6 @@ NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
 
 
 def fetch_product_ids() -> list[str]:
-    """
-    Intercepta las llamadas que hace el JS de la página a la API de productos
-    mientras se hace scroll, para capturar todos los bloques de lazy loading.
-    """
     captured_ids: list[str] = []
 
     def handle_request(request):
@@ -35,7 +30,7 @@ def fetch_product_ids() -> list[str]:
             return
         ids_raw = params["productIds"][0]
         ids = [pid.strip() for pid in ids_raw.split(",") if pid.strip()]
-        print(f"  -> Bloque interceptado: {len(ids)} productos")
+        print(f"  -> Bloque interceptado: {len(ids)} productos (total acumulado: {len(captured_ids) + len(ids)})")
         captured_ids.extend(ids)
 
     with sync_playwright() as p:
@@ -56,31 +51,39 @@ def fetch_product_ids() -> list[str]:
             locale="es-ES",
             timezone_id="Europe/Madrid",
             extra_http_headers={"Accept-Language": "es-ES,es;q=0.9,en;q=0.8"},
+            # Viewport grande para que el lazy loading detecte más elementos visibles
+            viewport={"width": 1920, "height": 1080},
         )
 
         page = context.new_page()
         page.on("request", handle_request)
 
-        # Visitar home para obtener cookies
         print("  -> Cargando home...")
         page.goto("https://www.uniqlo.com/es/es/", wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2000)
 
-        # Página de ofertas
         print("  -> Cargando página de ofertas...")
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)
 
-        # Scroll progresivo hacia abajo para disparar todos los bloques de lazy loading.
-        # Bajamos en pasos, esperando entre cada uno para dar tiempo a la API.
+        # Espera inicial más larga para que la página pinte el primer bloque
+        page.wait_for_timeout(5000)
+
+        # Scroll hasta el fondo real de la página, en pasos, esperando entre cada uno
         print("  -> Scrolleando para cargar todos los productos...")
-        for i in range(20):
-            page.evaluate("window.scrollBy(0, 1500)")
-            page.wait_for_timeout(1000)
+        previous_height = -1
+        for i in range(30):
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(2000)
+            current_height = page.evaluate("document.body.scrollHeight")
+            print(f"     Paso {i+1}: altura={current_height}px, productos={len(captured_ids)}")
+            # Si la altura de la página ya no crece, hemos llegado al fondo
+            if current_height == previous_height:
+                print("  -> Fondo de página alcanzado, scroll completo.")
+                break
+            previous_height = current_height
 
-        # Pausa final para asegurar que la última llamada haya terminado
+        # Pausa final
         page.wait_for_timeout(3000)
-
         browser.close()
 
     if not captured_ids:
@@ -89,7 +92,6 @@ def fetch_product_ids() -> list[str]:
             "La página puede haber cambiado de estructura."
         )
 
-    # Deduplicar manteniendo orden
     seen = set()
     result = []
     for pid in captured_ids:
