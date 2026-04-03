@@ -1,7 +1,6 @@
 import os
 import json
 import smtplib
-from urllib.parse import urlparse, parse_qs
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
@@ -18,29 +17,6 @@ NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
 
 
 def fetch_product_ids() -> list[str]:
-    captured_ids: list[str] = []
-
-    def handle_response(response):
-        """Intercepta las páginas del catálogo paginado (offset=36, 72, ...)."""
-        url = response.url
-        if "/api/commerce/v5/es/products" not in url:
-            return
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query)
-        if "path" not in params:
-            return
-        try:
-            data = response.json()
-            items = data.get("result", {}).get("items", [])
-            if not items:
-                return
-            ids = [item["productId"] for item in items if "productId" in item]
-            offset = params.get("offset", ["0"])[0]
-            print(f"  -> [catálogo offset={offset}] {len(ids)} productos (total acumulado: {len(captured_ids) + len(ids)})")
-            captured_ids.extend(ids)
-        except Exception as e:
-            print(f"  -> Error parseando respuesta paginada: {e}")
-
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -63,7 +39,6 @@ def fetch_product_ids() -> list[str]:
         )
 
         page = context.new_page()
-        page.on("response", handle_response)
 
         print("  -> Cargando home...")
         page.goto("https://www.uniqlo.com/es/es/", wait_until="domcontentloaded", timeout=60000)
@@ -73,30 +48,8 @@ def fetch_product_ids() -> list[str]:
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(5000)
 
-        # ── Extraer offset=0 del DOM ───────────────────────────────────────
-        # Los primeros productos están renderizados en el HTML inicial,
-        # nunca generan petición de red. Los extraemos de los enlaces del DOM.
-        print("  -> Extrayendo productos iniciales del DOM...")
-        dom_ids = page.evaluate("""
-            () => {
-                const links = document.querySelectorAll('a[href*="/products/"]');
-                const ids = new Set();
-                links.forEach(a => {
-                    const m = a.href.match(/\\/products\\/(E\\d+-\\d+)/);
-                    if (m) ids.add(m[1]);
-                });
-                return Array.from(ids);
-            }
-        """)
-        if dom_ids:
-            print(f"  -> [DOM inicial] {len(dom_ids)} productos encontrados")
-            captured_ids.extend(dom_ids)
-        else:
-            print("  -> [DOM inicial] Sin productos encontrados en el DOM")
-        # ──────────────────────────────────────────────────────────────────
-
-        # ── Scroll para disparar offset=36, 72, ... ────────────────────────
-        print("  -> Scrolleando para cargar páginas siguientes...")
+        # Scroll incremental para que todos los productos se rendericen en el DOM
+        print("  -> Scrolleando para renderizar todos los productos...")
         VIEWPORT_HEIGHT = 1080
         STEP = VIEWPORT_HEIGHT
         PAUSE_MS = 2500
@@ -109,33 +62,40 @@ def fetch_product_ids() -> list[str]:
             page.wait_for_timeout(PAUSE_MS)
 
             page_height = page.evaluate("document.body.scrollHeight")
-            print(f"     Paso {i+1}: pos={current_pos}px / altura={page_height}px, productos={len(captured_ids)}")
+            print(f"     Paso {i+1}: pos={current_pos}px / altura={page_height}px")
 
             if current_pos >= page_height:
                 page.wait_for_timeout(3000)
-                print("  -> Fondo de página alcanzado, scroll completo.")
+                print("  -> Fondo de página alcanzado.")
                 break
         else:
-            print("  -> Límite de pasos alcanzado, terminando scroll.")
+            print("  -> Límite de pasos alcanzado.")
 
-        page.wait_for_timeout(3000)
+        # Leer el DOM una sola vez, con todos los productos ya renderizados
+        print("  -> Extrayendo IDs del DOM...")
+        dom_ids = page.evaluate("""
+            () => {
+                const links = document.querySelectorAll('a[href*="/products/"]');
+                const ids = new Set();
+                links.forEach(a => {
+                    const m = a.href.match(/\\/products\\/(E\\d+-\\d+)/);
+                    if (m) ids.add(m[1]);
+                });
+                return Array.from(ids);
+            }
+        """)
+
         browser.close()
 
-    if not captured_ids:
+    print(f"  -> {len(dom_ids)} productos únicos extraídos del DOM")
+
+    if not dom_ids:
         raise ValueError(
-            "No se capturó ningún producto. "
+            "No se encontró ningún producto en el DOM. "
             "La página puede haber cambiado de estructura."
         )
 
-    seen = set()
-    result = []
-    for pid in captured_ids:
-        if pid not in seen:
-            seen.add(pid)
-            result.append(pid)
-
-    print(f"  -> Total tras deduplicar: {len(result)} productos únicos")
-    return result
+    return dom_ids
 
 
 def load_state() -> set[str]:
