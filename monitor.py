@@ -15,7 +15,6 @@ GMAIL_USER   = os.environ["GMAIL_USER"]
 GMAIL_PASS   = os.environ["GMAIL_PASS"]
 NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
 
-# Parámetros del catálogo de ofertas de hombre (estables)
 CATALOG_PATH      = "37609%2C%2C%2C"
 CATALOG_GENDER_ID = "37609"
 CATALOG_LIMIT     = 36
@@ -71,10 +70,9 @@ def fetch_product_ids() -> list[str]:
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(5000)
 
-        # ── Catálogo paginado: llamadas directas a la API ──────────────────
-        # El bloque offset=0 no genera petición de red (viene en el bundle inicial),
-        # así que pedimos todas las páginas explícitamente desde offset=0.
-        print("  -> Consultando catálogo paginado directamente...")
+        # ── Catálogo paginado: fetch() desde dentro del browser ────────────
+        # Así hereda automáticamente las cookies y headers de sesión de Akamai.
+        print("  -> Consultando catálogo paginado desde el browser...")
         offset = 0
         while True:
             api_url = (
@@ -88,8 +86,12 @@ def fetch_product_ids() -> list[str]:
                 f"&httpFailure=true"
             )
             try:
-                response = page.request.get(api_url, timeout=30000)
-                data = response.json()
+                data = page.evaluate(f"""
+                    async () => {{
+                        const r = await fetch("{api_url}");
+                        return await r.json();
+                    }}
+                """)
                 items = data.get("result", {}).get("items", [])
                 if not items:
                     print(f"  -> [catálogo offset={offset}] Sin más resultados. Paginación completa.")
