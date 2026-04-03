@@ -5,7 +5,7 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
-from playwright.sync_api import sync_playwright
+from patchright.sync_api import sync_playwright  # ← cambiado de playwright a patchright
 
 # ── Configuración ──────────────────────────────────────────────────────────────
 URL = "https://www.uniqlo.com/es/es/feature/sale/men/"
@@ -25,8 +25,6 @@ def fetch_product_ids() -> list[str]:
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
                 "--disable-dev-shm-usage",
             ]
         )
@@ -39,11 +37,6 @@ def fetch_product_ids() -> list[str]:
             locale="es-ES",
             timezone_id="Europe/Madrid",
             extra_http_headers={"Accept-Language": "es-ES,es;q=0.9,en;q=0.8"},
-        )
-
-        # Ocultar navigator.webdriver para evitar detección básica
-        context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
 
         page = context.new_page()
@@ -59,18 +52,17 @@ def fetch_product_ids() -> list[str]:
         html = page.content()
         browser.close()
 
-    # ── DEBUG: diagnóstico de lo que devuelve el servidor ──────────────────────
-    print("=== HTML SNIPPET (primeros 1500 chars) ===")
-    print(html[:1500])
-    print("=== FIN SNIPPET ===")
+    # ── DEBUG: diagnóstico (puedes eliminar este bloque una vez que funcione) ──
     has_next_data = 'id="__NEXT_DATA__"' in html
     has_akamai    = 'elgnisolqinu' in html or '_abck' in html
     print(f"  __NEXT_DATA__ presente: {has_next_data}")
     print(f"  Challenge Akamai detectado: {has_akamai}")
-    # ──────────────────────────────────────────────────────────────────────────
-
     if not has_next_data:
+        print("=== HTML SNIPPET (primeros 1500 chars) ===")
+        print(html[:1500])
+        print("=== FIN SNIPPET ===")
         raise ValueError("Página no cargada correctamente — posible challenge Akamai")
+    # ──────────────────────────────────────────────────────────────────────────
 
     # Extraer __NEXT_DATA__
     match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
