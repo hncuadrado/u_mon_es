@@ -19,9 +19,19 @@ NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
 
 def fetch_product_ids() -> list[str]:
     captured_ids: list[str] = []
+    api_calls_seen: list[str] = []   # ← DIAGNÓSTICO: todas las llamadas API
 
     def handle_request(request):
         url = request.url
+
+        # ── DIAGNÓSTICO: loguear TODAS las llamadas a la API de Uniqlo ──────
+        if "uniqlo.com/es/api" in url or "uniqlo.com/api" in url:
+            short = url[:180]
+            if short not in api_calls_seen:
+                api_calls_seen.append(short)
+                print(f"  [API] {short}")
+        # ─────────────────────────────────────────────────────────────────────
+
         if "/api/commerce/v5/es/products" not in url:
             return
         parsed = urlparse(url)
@@ -65,16 +75,13 @@ def fetch_product_ids() -> list[str]:
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(5000)
 
-        # Scroll incremental: avanza un viewport cada vez para que el
-        # IntersectionObserver detecte cada sección al pasar por pantalla.
         print("  -> Scrolleando incrementalmente para activar lazy loading...")
         VIEWPORT_HEIGHT = 1080
-        STEP = VIEWPORT_HEIGHT          # avanza exactamente un viewport por paso
-        PAUSE_MS = 2500                 # espera entre pasos (ms)
-        MAX_STEPS = 120                 # tope de seguridad (~120 * 1080px = ~130m)
+        STEP = VIEWPORT_HEIGHT
+        PAUSE_MS = 2500
+        MAX_STEPS = 120
 
         current_pos = 0
-        previous_height = -1
 
         for i in range(MAX_STEPS):
             current_pos += STEP
@@ -84,18 +91,22 @@ def fetch_product_ids() -> list[str]:
             page_height = page.evaluate("document.body.scrollHeight")
             print(f"     Paso {i+1}: pos={current_pos}px / altura={page_height}px, productos={len(captured_ids)}")
 
-            # Si ya pasamos el final de la página, hemos terminado
             if current_pos >= page_height:
-                # Pausa extra por si hay peticiones en vuelo tras el último scroll
                 page.wait_for_timeout(3000)
                 print("  -> Fondo de página alcanzado, scroll completo.")
                 break
-
-            previous_height = page_height
         else:
             print("  -> Límite de pasos alcanzado, terminando scroll.")
 
         page.wait_for_timeout(3000)
+
+        # ── DIAGNÓSTICO: resumen de todas las URLs API vistas ────────────────
+        print("\n  ══ RESUMEN DE LLAMADAS API CAPTURADAS ══")
+        for call in api_calls_seen:
+            print(f"  {call}")
+        print("  ════════════════════════════════════════\n")
+        # ─────────────────────────────────────────────────────────────────────
+
         browser.close()
 
     if not captured_ids:
