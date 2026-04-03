@@ -35,14 +35,13 @@ def fetch_product_ids() -> list[str]:
         captured_ids.extend(ids)
 
     def handle_response(response):
-        """Intercepta las páginas del catálogo paginado (IDs en el JSON de respuesta)."""
+        """Intercepta todas las páginas del catálogo paginado (IDs en el JSON de respuesta)."""
         url = response.url
         if "/api/commerce/v5/es/products" not in url:
             return
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
-        # Solo nos interesan las llamadas de catálogo paginado (tienen 'path' y 'offset')
-        if "path" not in params or "offset" not in params:
+        if "path" not in params:
             return
         try:
             data = response.json()
@@ -50,7 +49,8 @@ def fetch_product_ids() -> list[str]:
             if not items:
                 return
             ids = [item["productId"] for item in items if "productId" in item]
-            print(f"  -> [catálogo offset={params['offset'][0]}] {len(ids)} productos (total acumulado: {len(captured_ids) + len(ids)})")
+            offset = params.get("offset", ["0"])[0]
+            print(f"  -> [catálogo offset={offset}] {len(ids)} productos (total acumulado: {len(captured_ids) + len(ids)})")
             captured_ids.extend(ids)
         except Exception as e:
             print(f"  -> Error parseando respuesta paginada: {e}")
@@ -78,7 +78,7 @@ def fetch_product_ids() -> list[str]:
 
         page = context.new_page()
         page.on("request", handle_request)
-        page.on("response", handle_response)   # ← nuevo
+        page.on("response", handle_response)
 
         print("  -> Cargando home...")
         page.goto("https://www.uniqlo.com/es/es/", wait_until="domcontentloaded", timeout=60000)
