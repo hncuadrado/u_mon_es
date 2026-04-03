@@ -8,12 +8,17 @@ from datetime import datetime, timezone
 from patchright.sync_api import sync_playwright
 
 # ── Configuración ──────────────────────────────────────────────────────────────
-URL = "https://www.uniqlo.com/es/es/feature/sale/men/"
+URL        = "https://www.uniqlo.com/es/es/feature/sale/men/"
 STATE_FILE = "state.json"
 
 GMAIL_USER   = os.environ["GMAIL_USER"]
 GMAIL_PASS   = os.environ["GMAIL_PASS"]
 NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
+
+# Parámetros del catálogo de ofertas de hombre (estables)
+CATALOG_PATH      = "37609%2C%2C%2C"
+CATALOG_GENDER_ID = "37609"
+CATALOG_LIMIT     = 36
 # ───────────────────────────────────────────────────────────────────────────────
 
 
@@ -31,29 +36,8 @@ def fetch_product_ids() -> list[str]:
             return
         ids_raw = params["productIds"][0]
         ids = [pid.strip() for pid in ids_raw.split(",") if pid.strip()]
-        print(f"  -> [editorial] Bloque interceptado: {len(ids)} productos (total acumulado: {len(captured_ids) + len(ids)})")
+        print(f"  -> [editorial] {len(ids)} productos (total acumulado: {len(captured_ids) + len(ids)})")
         captured_ids.extend(ids)
-
-    def handle_response(response):
-        """Intercepta todas las páginas del catálogo paginado (IDs en el JSON de respuesta)."""
-        url = response.url
-        if "/api/commerce/v5/es/products" not in url:
-            return
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query)
-        if "path" not in params:
-            return
-        try:
-            data = response.json()
-            items = data.get("result", {}).get("items", [])
-            if not items:
-                return
-            ids = [item["productId"] for item in items if "productId" in item]
-            offset = params.get("offset", ["0"])[0]
-            print(f"  -> [catálogo offset={offset}] {len(ids)} productos (total acumulado: {len(captured_ids) + len(ids)})")
-            captured_ids.extend(ids)
-        except Exception as e:
-            print(f"  -> Error parseando respuesta paginada: {e}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -78,7 +62,6 @@ def fetch_product_ids() -> list[str]:
 
         page = context.new_page()
         page.on("request", handle_request)
-        page.on("response", handle_response)
 
         print("  -> Cargando home...")
         page.goto("https://www.uniqlo.com/es/es/", wait_until="domcontentloaded", timeout=60000)
@@ -88,35 +71,43 @@ def fetch_product_ids() -> list[str]:
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(5000)
 
-        print("  -> Scrolleando incrementalmente para activar lazy loading...")
-        VIEWPORT_HEIGHT = 1080
-        STEP = VIEWPORT_HEIGHT
-        PAUSE_MS = 2500
-        MAX_STEPS = 120
-
-        current_pos = 0
-
-        for i in range(MAX_STEPS):
-            current_pos += STEP
-            page.evaluate(f"window.scrollTo(0, {current_pos})")
-            page.wait_for_timeout(PAUSE_MS)
-
-            page_height = page.evaluate("document.body.scrollHeight")
-            print(f"     Paso {i+1}: pos={current_pos}px / altura={page_height}px, productos={len(captured_ids)}")
-
-            if current_pos >= page_height:
-                page.wait_for_timeout(3000)
-                print("  -> Fondo de página alcanzado, scroll completo.")
+        # ── Catálogo paginado: llamadas directas a la API ──────────────────
+        # El bloque offset=0 no genera petición de red (viene en el bundle inicial),
+        # así que pedimos todas las páginas explícitamente desde offset=0.
+        print("  -> Consultando catálogo paginado directamente...")
+        offset = 0
+        while True:
+            api_url = (
+                f"https://www.uniqlo.com/es/api/commerce/v5/es/products"
+                f"?path={CATALOG_PATH}"
+                f"&flagCodes=discount"
+                f"&genderId={CATALOG_GENDER_ID}"
+                f"&offset={offset}"
+                f"&limit={CATALOG_LIMIT}"
+                f"&imageRatio=3x4"
+                f"&httpFailure=true"
+            )
+            try:
+                response = page.request.get(api_url, timeout=30000)
+                data = response.json()
+                items = data.get("result", {}).get("items", [])
+                if not items:
+                    print(f"  -> [catálogo offset={offset}] Sin más resultados. Paginación completa.")
+                    break
+                ids = [item["productId"] for item in items if "productId" in item]
+                print(f"  -> [catálogo offset={offset}] {len(ids)} productos (total acumulado: {len(captured_ids) + len(ids)})")
+                captured_ids.extend(ids)
+                offset += CATALOG_LIMIT
+            except Exception as e:
+                print(f"  -> Error en catálogo offset={offset}: {e}")
                 break
-        else:
-            print("  -> Límite de pasos alcanzado, terminando scroll.")
+        # ──────────────────────────────────────────────────────────────────
 
-        page.wait_for_timeout(3000)
         browser.close()
 
     if not captured_ids:
         raise ValueError(
-            "No se interceptó ninguna llamada a /api/commerce/v5/es/products. "
+            "No se capturó ningún producto. "
             "La página puede haber cambiado de estructura."
         )
 
