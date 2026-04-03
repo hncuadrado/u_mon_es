@@ -20,25 +20,22 @@ NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
 
 def fetch_product_ids() -> list[str]:
     """
-    Intercepta la llamada que hace el JS de la página a la API de productos
-    y extrae los IDs directamente del parámetro ?productIds= de la URL.
+    Intercepta las llamadas que hace el JS de la página a la API de productos
+    mientras se hace scroll, para capturar todos los bloques de lazy loading.
     """
     captured_ids: list[str] = []
 
     def handle_request(request):
-        """Se ejecuta por cada petición HTTP que lanza el browser."""
         url = request.url
-        # Solo nos interesa la API de productos de Uniqlo
         if "/api/commerce/v5/es/products" not in url:
             return
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
         if "productIds" not in params:
             return
-        # productIds viene como string separado por comas: "E482873-000,E484204-000,..."
         ids_raw = params["productIds"][0]
         ids = [pid.strip() for pid in ids_raw.split(",") if pid.strip()]
-        print(f"  -> API interceptada con {len(ids)} productIds: {url[:120]}...")
+        print(f"  -> Bloque interceptado: {len(ids)} productos")
         captured_ids.extend(ids)
 
     with sync_playwright() as p:
@@ -62,8 +59,6 @@ def fetch_product_ids() -> list[str]:
         )
 
         page = context.new_page()
-
-        # Escuchar peticiones (no respuestas) — los IDs están en la URL de la request
         page.on("request", handle_request)
 
         # Visitar home para obtener cookies
@@ -74,10 +69,17 @@ def fetch_product_ids() -> list[str]:
         # Página de ofertas
         print("  -> Cargando página de ofertas...")
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(3000)
 
-        # Esperar a que el JS del cliente lance la llamada a la API de productos
-        print("  -> Esperando llamada a la API de productos (20s máx)...")
-        page.wait_for_timeout(20000)
+        # Scroll progresivo hacia abajo para disparar todos los bloques de lazy loading.
+        # Bajamos en pasos, esperando entre cada uno para dar tiempo a la API.
+        print("  -> Scrolleando para cargar todos los productos...")
+        for i in range(20):
+            page.evaluate("window.scrollBy(0, 1500)")
+            page.wait_for_timeout(1000)
+
+        # Pausa final para asegurar que la última llamada haya terminado
+        page.wait_for_timeout(3000)
 
         browser.close()
 
@@ -94,6 +96,8 @@ def fetch_product_ids() -> list[str]:
         if pid not in seen:
             seen.add(pid)
             result.append(pid)
+
+    print(f"  -> Total tras deduplicar: {len(result)} productos únicos")
     return result
 
 
@@ -155,7 +159,7 @@ def main():
     print(f"[{now}] Comprobando ofertas...")
 
     current_ids = fetch_product_ids()
-    print(f"  -> {len(current_ids)} articulos en la seccion ahora")
+    print(f"  -> {len(current_ids)} articulos detectados en total")
 
     previous_ids = load_state()
 
