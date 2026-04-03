@@ -19,19 +19,10 @@ NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
 
 def fetch_product_ids() -> list[str]:
     captured_ids: list[str] = []
-    api_calls_seen: list[str] = []   # ← DIAGNÓSTICO: todas las llamadas API
 
     def handle_request(request):
+        """Intercepta los bloques editoriales (productIds en la URL)."""
         url = request.url
-
-        # ── DIAGNÓSTICO: loguear TODAS las llamadas a la API de Uniqlo ──────
-        if "uniqlo.com/es/api" in url or "uniqlo.com/api" in url:
-            short = url[:180]
-            if short not in api_calls_seen:
-                api_calls_seen.append(short)
-                print(f"  [API] {short}")
-        # ─────────────────────────────────────────────────────────────────────
-
         if "/api/commerce/v5/es/products" not in url:
             return
         parsed = urlparse(url)
@@ -40,8 +31,29 @@ def fetch_product_ids() -> list[str]:
             return
         ids_raw = params["productIds"][0]
         ids = [pid.strip() for pid in ids_raw.split(",") if pid.strip()]
-        print(f"  -> Bloque interceptado: {len(ids)} productos (total acumulado: {len(captured_ids) + len(ids)})")
+        print(f"  -> [editorial] Bloque interceptado: {len(ids)} productos (total acumulado: {len(captured_ids) + len(ids)})")
         captured_ids.extend(ids)
+
+    def handle_response(response):
+        """Intercepta las páginas del catálogo paginado (IDs en el JSON de respuesta)."""
+        url = response.url
+        if "/api/commerce/v5/es/products" not in url:
+            return
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        # Solo nos interesan las llamadas de catálogo paginado (tienen 'path' y 'offset')
+        if "path" not in params or "offset" not in params:
+            return
+        try:
+            data = response.json()
+            items = data.get("result", {}).get("items", [])
+            if not items:
+                return
+            ids = [item["productId"] for item in items if "productId" in item]
+            print(f"  -> [catálogo offset={params['offset'][0]}] {len(ids)} productos (total acumulado: {len(captured_ids) + len(ids)})")
+            captured_ids.extend(ids)
+        except Exception as e:
+            print(f"  -> Error parseando respuesta paginada: {e}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -66,6 +78,7 @@ def fetch_product_ids() -> list[str]:
 
         page = context.new_page()
         page.on("request", handle_request)
+        page.on("response", handle_response)   # ← nuevo
 
         print("  -> Cargando home...")
         page.goto("https://www.uniqlo.com/es/es/", wait_until="domcontentloaded", timeout=60000)
@@ -99,14 +112,6 @@ def fetch_product_ids() -> list[str]:
             print("  -> Límite de pasos alcanzado, terminando scroll.")
 
         page.wait_for_timeout(3000)
-
-        # ── DIAGNÓSTICO: resumen de todas las URLs API vistas ────────────────
-        print("\n  ══ RESUMEN DE LLAMADAS API CAPTURADAS ══")
-        for call in api_calls_seen:
-            print(f"  {call}")
-        print("  ════════════════════════════════════════\n")
-        # ─────────────────────────────────────────────────────────────────────
-
         browser.close()
 
     if not captured_ids:
