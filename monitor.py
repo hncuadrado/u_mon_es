@@ -54,10 +54,22 @@ def fetch_product_ids() -> list[str]:
 
         # Ahora la página de ofertas
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_selector('script#__NEXT_DATA__', timeout=15000)
+        if not has_next_data:
+        raise ValueError("Página no cargada correctamente (posible challenge Akamai)")
 
         html = page.content()
         browser.close()
+        
+        # ── DEBUG: volcar HTML para ver qué devuelve Akamai ──────────
+        html = page.content()
+        print("=== HTML SNIPPET (primeros 1500 chars) ===")
+        print(html[:1500])
+        print("=== FIN SNIPPET ===")
+        has_next_data = 'id="__NEXT_DATA__"' in html
+        has_akamai    = 'elgnisolqinu' in html or '_abck' in html
+        print(f"  __NEXT_DATA__ presente: {has_next_data}")
+        print(f"  Challenge Akamai detectado: {has_akamai}")
+# ─────────────────────────────────────────────────────────────
 
     # Extraer __NEXT_DATA__
     match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
