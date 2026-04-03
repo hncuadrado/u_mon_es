@@ -18,7 +18,48 @@ NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
 
 
 def fetch_product_ids() -> list[str]:
-    """Carga la página con un navegador real para superar Akamai y extrae los productIds."""
+    """
+    Carga la página e intercepta las llamadas de red de Next.js para extraer
+    los productIds — sin depender de __NEXT_DATA__ en el HTML.
+    """
+    captured_ids: list[str] = []
+    api_calls_seen: list[str] = []  # para diagnóstico
+
+    def handle_response(response):
+        """Callback que se ejecuta por cada respuesta HTTP que recibe el browser."""
+        url = response.url
+        # Solo nos interesan respuestas JSON de las APIs de Uniqlo
+        if "uniqlo.com" not in url:
+            return
+        if response.status != 200:
+            return
+        ct = response.headers.get("content-type", "")
+        if "json" not in ct:
+            return
+
+        api_calls_seen.append(url)
+
+        try:
+            body = response.json()
+        except Exception:
+            return
+
+        # Buscar productIds en cualquier parte del JSON (igual que el walk original)
+        def walk(node):
+            if isinstance(node, dict):
+                if node.get("_type") == "CmsProductCollection":
+                    pids = node.get("productIds", {})
+                    captured_ids.extend(pids.get("prioritized", []))
+                    captured_ids.extend(pids.get("default", []))
+                # También buscar arrays que parezcan listas de product IDs
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(body)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -41,63 +82,40 @@ def fetch_product_ids() -> list[str]:
 
         page = context.new_page()
 
-        # Primero visitar la home para obtener cookies
+        # Registrar el listener ANTES de navegar para no perder ninguna respuesta
+        page.on("response", handle_response)
+
+        # Visitar home para cookies
         print("  -> Cargando home...")
         page.goto("https://www.uniqlo.com/es/es/", wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2000)
 
-        # Ahora la página de ofertas
+        # Página de ofertas — esperamos hasta que la red se calme o pase el tiempo máximo
         print("  -> Cargando página de ofertas...")
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
 
-        # Esperar activamente a que __NEXT_DATA__ aparezca en el DOM.
-        # Esto cubre el tiempo que tarda Akamai en resolver el challenge
-        # y Next.js en inyectar los datos (puede tardar varios segundos).
-        print("  -> Esperando __NEXT_DATA__...")
-        try:
-            page.wait_for_function(
-                "() => document.getElementById('__NEXT_DATA__') !== null",
-                timeout=30000
-            )
-            print("  -> __NEXT_DATA__ detectado en el DOM")
-        except Exception:
-            # Si no aparece en 30s, volcamos el HTML para diagnóstico
-            html = page.content()
-            browser.close()
-            print("=== HTML SNIPPET (primeros 2000 chars) ===")
-            print(html[:2000])
-            print("=== FIN SNIPPET ===")
-            raise ValueError("__NEXT_DATA__ no apareció en 30 segundos — Akamai sigue bloqueando")
+        # Dar tiempo a que el JS del cliente haga sus llamadas a la API
+        print("  -> Esperando llamadas de API del cliente (15s)...")
+        page.wait_for_timeout(15000)
 
-        html = page.content()
         browser.close()
 
-    # Extraer __NEXT_DATA__
-    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
-    if not match:
-        raise ValueError("__NEXT_DATA__ presente en DOM pero no extraíble con regex")
+    # ── Diagnóstico ────────────────────────────────────────────────────────────
+    print(f"  -> APIs de Uniqlo interceptadas: {len(api_calls_seen)}")
+    for u in api_calls_seen[:20]:   # mostrar máx 20 para no saturar el log
+        print(f"     {u}")
+    # ──────────────────────────────────────────────────────────────────────────
 
-    data = json.loads(match.group(1))
+    if not captured_ids:
+        raise ValueError(
+            "No se encontraron productIds en ninguna llamada de API. "
+            "Revisa el log de APIs interceptadas para identificar el endpoint correcto."
+        )
 
-    ids: list[str] = []
-
-    def walk(node):
-        if isinstance(node, dict):
-            if node.get("_type") == "CmsProductCollection":
-                product_ids = node.get("productIds", {})
-                ids.extend(product_ids.get("prioritized", []))
-                ids.extend(product_ids.get("default", []))
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
-
-    walk(data)
-
+    # Deduplicar manteniendo orden
     seen = set()
     result = []
-    for pid in ids:
+    for pid in captured_ids:
         if pid not in seen:
             seen.add(pid)
             result.append(pid)
