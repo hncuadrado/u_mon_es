@@ -51,7 +51,6 @@ def fetch_product_ids() -> list[str]:
             locale="es-ES",
             timezone_id="Europe/Madrid",
             extra_http_headers={"Accept-Language": "es-ES,es;q=0.9,en;q=0.8"},
-            # Viewport grande para que el lazy loading detecte más elementos visibles
             viewport={"width": 1920, "height": 1080},
         )
 
@@ -64,25 +63,38 @@ def fetch_product_ids() -> list[str]:
 
         print("  -> Cargando página de ofertas...")
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-
-        # Espera inicial más larga para que la página pinte el primer bloque
         page.wait_for_timeout(5000)
 
-        # Scroll hasta el fondo real de la página, en pasos, esperando entre cada uno
-        print("  -> Scrolleando para cargar todos los productos...")
+        # Scroll incremental: avanza un viewport cada vez para que el
+        # IntersectionObserver detecte cada sección al pasar por pantalla.
+        print("  -> Scrolleando incrementalmente para activar lazy loading...")
+        VIEWPORT_HEIGHT = 1080
+        STEP = VIEWPORT_HEIGHT          # avanza exactamente un viewport por paso
+        PAUSE_MS = 2500                 # espera entre pasos (ms)
+        MAX_STEPS = 120                 # tope de seguridad (~120 * 1080px = ~130m)
+
+        current_pos = 0
         previous_height = -1
-        for i in range(30):
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(2000)
-            current_height = page.evaluate("document.body.scrollHeight")
-            print(f"     Paso {i+1}: altura={current_height}px, productos={len(captured_ids)}")
-            # Si la altura de la página ya no crece, hemos llegado al fondo
-            if current_height == previous_height:
+
+        for i in range(MAX_STEPS):
+            current_pos += STEP
+            page.evaluate(f"window.scrollTo(0, {current_pos})")
+            page.wait_for_timeout(PAUSE_MS)
+
+            page_height = page.evaluate("document.body.scrollHeight")
+            print(f"     Paso {i+1}: pos={current_pos}px / altura={page_height}px, productos={len(captured_ids)}")
+
+            # Si ya pasamos el final de la página, hemos terminado
+            if current_pos >= page_height:
+                # Pausa extra por si hay peticiones en vuelo tras el último scroll
+                page.wait_for_timeout(3000)
                 print("  -> Fondo de página alcanzado, scroll completo.")
                 break
-            previous_height = current_height
 
-        # Pausa final
+            previous_height = page_height
+        else:
+            print("  -> Límite de pasos alcanzado, terminando scroll.")
+
         page.wait_for_timeout(3000)
         browser.close()
 
