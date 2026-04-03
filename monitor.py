@@ -2,6 +2,7 @@ import os
 import json
 import re
 import smtplib
+from urllib.parse import urlparse, parse_qs
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
@@ -19,46 +20,26 @@ NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
 
 def fetch_product_ids() -> list[str]:
     """
-    Carga la página e intercepta las llamadas de red de Next.js para extraer
-    los productIds — sin depender de __NEXT_DATA__ en el HTML.
+    Intercepta la llamada que hace el JS de la página a la API de productos
+    y extrae los IDs directamente del parámetro ?productIds= de la URL.
     """
     captured_ids: list[str] = []
-    api_calls_seen: list[str] = []  # para diagnóstico
 
-    def handle_response(response):
-        """Callback que se ejecuta por cada respuesta HTTP que recibe el browser."""
-        url = response.url
-        # Solo nos interesan respuestas JSON de las APIs de Uniqlo
-        if "uniqlo.com" not in url:
+    def handle_request(request):
+        """Se ejecuta por cada petición HTTP que lanza el browser."""
+        url = request.url
+        # Solo nos interesa la API de productos de Uniqlo
+        if "/api/commerce/v5/es/products" not in url:
             return
-        if response.status != 200:
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        if "productIds" not in params:
             return
-        ct = response.headers.get("content-type", "")
-        if "json" not in ct:
-            return
-
-        api_calls_seen.append(url)
-
-        try:
-            body = response.json()
-        except Exception:
-            return
-
-        # Buscar productIds en cualquier parte del JSON (igual que el walk original)
-        def walk(node):
-            if isinstance(node, dict):
-                if node.get("_type") == "CmsProductCollection":
-                    pids = node.get("productIds", {})
-                    captured_ids.extend(pids.get("prioritized", []))
-                    captured_ids.extend(pids.get("default", []))
-                # También buscar arrays que parezcan listas de product IDs
-                for v in node.values():
-                    walk(v)
-            elif isinstance(node, list):
-                for item in node:
-                    walk(item)
-
-        walk(body)
+        # productIds viene como string separado por comas: "E482873-000,E484204-000,..."
+        ids_raw = params["productIds"][0]
+        ids = [pid.strip() for pid in ids_raw.split(",") if pid.strip()]
+        print(f"  -> API interceptada con {len(ids)} productIds: {url[:120]}...")
+        captured_ids.extend(ids)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -82,34 +63,28 @@ def fetch_product_ids() -> list[str]:
 
         page = context.new_page()
 
-        # Registrar el listener ANTES de navegar para no perder ninguna respuesta
-        page.on("response", handle_response)
+        # Escuchar peticiones (no respuestas) — los IDs están en la URL de la request
+        page.on("request", handle_request)
 
-        # Visitar home para cookies
+        # Visitar home para obtener cookies
         print("  -> Cargando home...")
         page.goto("https://www.uniqlo.com/es/es/", wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2000)
 
-        # Página de ofertas — esperamos hasta que la red se calme o pase el tiempo máximo
+        # Página de ofertas
         print("  -> Cargando página de ofertas...")
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
 
-        # Dar tiempo a que el JS del cliente haga sus llamadas a la API
-        print("  -> Esperando llamadas de API del cliente (15s)...")
-        page.wait_for_timeout(15000)
+        # Esperar a que el JS del cliente lance la llamada a la API de productos
+        print("  -> Esperando llamada a la API de productos (20s máx)...")
+        page.wait_for_timeout(20000)
 
         browser.close()
 
-    # ── Diagnóstico ────────────────────────────────────────────────────────────
-    print(f"  -> APIs de Uniqlo interceptadas: {len(api_calls_seen)}")
-    for u in api_calls_seen[:20]:   # mostrar máx 20 para no saturar el log
-        print(f"     {u}")
-    # ──────────────────────────────────────────────────────────────────────────
-
     if not captured_ids:
         raise ValueError(
-            "No se encontraron productIds en ninguna llamada de API. "
-            "Revisa el log de APIs interceptadas para identificar el endpoint correcto."
+            "No se interceptó ninguna llamada a /api/commerce/v5/es/products. "
+            "La página puede haber cambiado de estructura."
         )
 
     # Deduplicar manteniendo orden
