@@ -14,29 +14,32 @@ STATE_FILE = "state.json"
 GMAIL_USER   = os.environ["GMAIL_USER"]
 GMAIL_PASS   = os.environ["GMAIL_PASS"]
 NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
-
-CATALOG_PATH      = "37609%2C%2C%2C"
-CATALOG_GENDER_ID = "37609"
-CATALOG_LIMIT     = 36
 # ───────────────────────────────────────────────────────────────────────────────
 
 
 def fetch_product_ids() -> list[str]:
     captured_ids: list[str] = []
 
-    def handle_request(request):
-        """Intercepta los bloques editoriales (productIds en la URL)."""
-        url = request.url
+    def handle_response(response):
+        """Intercepta las páginas del catálogo paginado (offset=36, 72, ...)."""
+        url = response.url
         if "/api/commerce/v5/es/products" not in url:
             return
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
-        if "productIds" not in params:
+        if "path" not in params:
             return
-        ids_raw = params["productIds"][0]
-        ids = [pid.strip() for pid in ids_raw.split(",") if pid.strip()]
-        print(f"  -> [editorial] {len(ids)} productos (total acumulado: {len(captured_ids) + len(ids)})")
-        captured_ids.extend(ids)
+        try:
+            data = response.json()
+            items = data.get("result", {}).get("items", [])
+            if not items:
+                return
+            ids = [item["productId"] for item in items if "productId" in item]
+            offset = params.get("offset", ["0"])[0]
+            print(f"  -> [catálogo offset={offset}] {len(ids)} productos (total acumulado: {len(captured_ids) + len(ids)})")
+            captured_ids.extend(ids)
+        except Exception as e:
+            print(f"  -> Error parseando respuesta paginada: {e}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -60,7 +63,7 @@ def fetch_product_ids() -> list[str]:
         )
 
         page = context.new_page()
-        page.on("request", handle_request)
+        page.on("response", handle_response)
 
         print("  -> Cargando home...")
         page.goto("https://www.uniqlo.com/es/es/", wait_until="domcontentloaded", timeout=60000)
@@ -70,41 +73,52 @@ def fetch_product_ids() -> list[str]:
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(5000)
 
-        # ── Catálogo paginado: fetch() desde dentro del browser ────────────
-        # Así hereda automáticamente las cookies y headers de sesión de Akamai.
-        print("  -> Consultando catálogo paginado desde el browser...")
-        offset = 0
-        while True:
-            api_url = (
-                f"https://www.uniqlo.com/es/api/commerce/v5/es/products"
-                f"?path={CATALOG_PATH}"
-                f"&flagCodes=discount"
-                f"&genderId={CATALOG_GENDER_ID}"
-                f"&offset={offset}"
-                f"&limit={CATALOG_LIMIT}"
-                f"&imageRatio=3x4"
-                f"&httpFailure=true"
-            )
-            try:
-                data = page.evaluate(f"""
-                    async () => {{
-                        const r = await fetch("{api_url}");
-                        return await r.json();
-                    }}
-                """)
-                items = data.get("result", {}).get("items", [])
-                if not items:
-                    print(f"  -> [catálogo offset={offset}] Sin más resultados. Paginación completa.")
-                    break
-                ids = [item["productId"] for item in items if "productId" in item]
-                print(f"  -> [catálogo offset={offset}] {len(ids)} productos (total acumulado: {len(captured_ids) + len(ids)})")
-                captured_ids.extend(ids)
-                offset += CATALOG_LIMIT
-            except Exception as e:
-                print(f"  -> Error en catálogo offset={offset}: {e}")
-                break
+        # ── Extraer offset=0 del DOM ───────────────────────────────────────
+        # Los primeros productos están renderizados en el HTML inicial,
+        # nunca generan petición de red. Los extraemos de los enlaces del DOM.
+        print("  -> Extrayendo productos iniciales del DOM...")
+        dom_ids = page.evaluate("""
+            () => {
+                const links = document.querySelectorAll('a[href*="/products/"]');
+                const ids = new Set();
+                links.forEach(a => {
+                    const m = a.href.match(/\\/products\\/(E\\d+-\\d+)/);
+                    if (m) ids.add(m[1]);
+                });
+                return Array.from(ids);
+            }
+        """)
+        if dom_ids:
+            print(f"  -> [DOM inicial] {len(dom_ids)} productos encontrados")
+            captured_ids.extend(dom_ids)
+        else:
+            print("  -> [DOM inicial] Sin productos encontrados en el DOM")
         # ──────────────────────────────────────────────────────────────────
 
+        # ── Scroll para disparar offset=36, 72, ... ────────────────────────
+        print("  -> Scrolleando para cargar páginas siguientes...")
+        VIEWPORT_HEIGHT = 1080
+        STEP = VIEWPORT_HEIGHT
+        PAUSE_MS = 2500
+        MAX_STEPS = 120
+
+        current_pos = 0
+        for i in range(MAX_STEPS):
+            current_pos += STEP
+            page.evaluate(f"window.scrollTo(0, {current_pos})")
+            page.wait_for_timeout(PAUSE_MS)
+
+            page_height = page.evaluate("document.body.scrollHeight")
+            print(f"     Paso {i+1}: pos={current_pos}px / altura={page_height}px, productos={len(captured_ids)}")
+
+            if current_pos >= page_height:
+                page.wait_for_timeout(3000)
+                print("  -> Fondo de página alcanzado, scroll completo.")
+                break
+        else:
+            print("  -> Límite de pasos alcanzado, terminando scroll.")
+
+        page.wait_for_timeout(3000)
         browser.close()
 
     if not captured_ids:
