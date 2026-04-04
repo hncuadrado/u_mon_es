@@ -2,8 +2,9 @@ name: Uniqlo Offers Monitor
 
 on:
   schedule:
-    # Cada 30 min de 5:00 a 23:30 UTC = 7:00 a 01:30 hora Madrid (verano CEST)
-    - cron: "0,30 5-23 * * *"
+    # Cada 10 min de 5:00 a 23:50 UTC = 7:00 a 01:50 hora Madrid (verano CEST)
+    # Requiere repo público para no consumir minutos del plan gratuito
+    - cron: "*/10 5-23 * * *"
   workflow_dispatch:
 
 jobs:
