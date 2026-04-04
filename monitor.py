@@ -131,31 +131,17 @@ def _parse_item(item: dict) -> tuple[str, dict]:
 
 
 def fetch_ids_and_details(previous_ids: set[str]) -> dict:
-    intercepted: dict    = {}
-    api_headers: dict    = {}   # cabeceras capturadas de una llamada real al API
-    api_base_url: list   = []   # URL base del API (para reutilizar)
+    intercepted: dict  = {}
+    captured_req: dict = {}   # una muestra de cabeceras + URL completa de API
 
     def on_request(request):
-        """Captura las cabeceras de las llamadas reales al API de productos."""
-        if (
-            "/api/commerce/v5/es/products" in request.url
-            and not api_headers                        # solo necesitamos una muestra
-        ):
-            # Guardamos todas las cabeceras de esa petición original
-            api_headers.update(dict(request.headers))
-            # Guardamos también la URL base (con el host correcto)
-            try:
-                from urllib.parse import urlparse
-                parsed = urlparse(request.url)
-                api_base_url.append(
-                    f"{parsed.scheme}://{parsed.netloc}"
-                    f"/api/commerce/v5/es/products"
-                )
-            except Exception:
-                pass
+        """Guarda cabeceras y URL de la primera llamada al API de productos."""
+        if "/api/commerce/v5/es/products" in request.url and not captured_req:
+            captured_req["url"]     = request.url
+            captured_req["headers"] = dict(request.headers)
 
     def on_response(response):
-        """Captura los datos de producto de las respuestas paginadas."""
+        """Captura datos de producto de las respuestas paginadas."""
         try:
             if (
                 "/api/commerce/v5/es/products" in response.url
@@ -222,6 +208,10 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
             print("  -> Límite de pasos alcanzado.")
 
         print(f"  -> {len(intercepted)} productos con datos interceptados por red")
+        if captured_req:
+            print(f"  -> Cabeceras capturadas de: {captured_req['url'][:100]}")
+        else:
+            print("  -> AVISO: no se capturó ninguna llamada al API durante el scroll")
 
         # ── Extracción DOM: IDs + URLs de imagen ──────────────────────────────
         print("  -> Extrayendo IDs e imágenes del DOM...")
@@ -255,82 +245,70 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
             if pid_d in intercepted:
                 intercepted[pid_d]["image_url"] = img_src
 
-        # ── Fetch complementario para productos sin datos ─────────────────────
         missing = [pid for pid in current_ids if pid not in intercepted]
         print(
-            f"  -> {len(current_ids)} productos únicos en oferta | "
-            f"cobertura: {len(intercepted)}/{len(current_ids)} | "
+            f"  -> {len(current_ids)} productos únicos | "
+            f"con datos: {len(intercepted)} | "
             f"sin datos: {len(missing)}"
         )
 
-        if missing and api_headers:
+        # ── Fetch complementario via context.request (hereda cookies, sin CORS) ─
+        if missing and captured_req:
+            # Construir cabeceras seguras (sin pseudo-cabeceras HTTP/2)
+            safe_headers = {
+                k: v for k, v in captured_req["headers"].items()
+                if not k.startswith(":")
+                and k.lower() not in ("content-length", "host")
+            }
+            # Extraer la base URL del endpoint (sin query string)
+            raw_url  = captured_req["url"]
+            base_url = raw_url.split("?")[0]
+
             print(
-                f"  -> Consultando API con cabeceras capturadas "
+                f"  -> Consultando API via context.request "
                 f"para {len(missing)} productos sin datos..."
             )
-            base_url  = (
-                api_base_url[0] if api_base_url
-                else "https://www.uniqlo.com/es/api/commerce/v5/es/products"
-            )
-            # Serializar cabeceras para pasarlas a JS (solo las relevantes)
-            safe_headers = {
-                k: v for k, v in api_headers.items()
-                if k.lower() not in (
-                    "content-length", "host", ":method", ":path",
-                    ":scheme", ":authority",
-                )
-            }
-            headers_json = json.dumps(safe_headers)
             BATCH = 20
-
             for start in range(0, len(missing), BATCH):
                 batch     = missing[start : start + BATCH]
                 ids_param = ",".join(batch)
                 api_url   = f"{base_url}?productIds={ids_param}"
 
-                api_resp = page.evaluate(f"""
-                    async () => {{
-                        try {{
-                            const headers = {headers_json};
-                            const r = await fetch('{api_url}', {{
-                                credentials: 'include',
-                                headers:     headers,
-                            }});
-                            const body = await r.json();
-                            return {{ status: r.status, body: body }};
-                        }} catch(e) {{
-                            return {{ status: 0, error: e.toString() }};
-                        }}
-                    }}
-                """)
+                try:
+                    resp = context.request.get(
+                        api_url,
+                        headers=safe_headers,
+                        timeout=30000,
+                    )
+                    print(f"     HTTP {resp.status}")
+                    if resp.status == 200:
+                        body  = resp.json()
+                        items = _extract_items_from_body(body)
+                        print(f"     Items recibidos: {len(items)}")
+                        # Log de diagnóstico por si la estructura es diferente
+                        if not items:
+                            raw = json.dumps(body, ensure_ascii=False)[:800]
+                            print(f"     RAW (sin items): {raw}")
+                        for item in items:
+                            pid_i, parsed = _parse_item(item)
+                            if pid_i:
+                                parsed["image_url"] = dom_images.get(pid_i)
+                                intercepted[pid_i]  = parsed
+                                print(
+                                    f"     {pid_i}: '{parsed['name']}' | "
+                                    f"{parsed['current_price']}€ "
+                                    f"(-{parsed['discount_pct']}%) | "
+                                    f"tallas: {parsed['sizes']}"
+                                )
+                    else:
+                        raw = resp.text()[:400]
+                        print(f"     Respuesta inesperada: {raw}")
+                except Exception as e:
+                    print(f"     Error en context.request: {e}")
 
-                status = api_resp.get("status", 0)
-                body   = api_resp.get("body", {})
-                print(f"     HTTP {status}")
-
-                if status != 200:
-                    raw = json.dumps(body, ensure_ascii=False)[:500]
-                    print(f"     Respuesta: {raw}")
-                    continue
-
-                items = _extract_items_from_body(body)
-                print(f"     Items recibidos: {len(items)}")
-
-                for item in items:
-                    pid_i, parsed = _parse_item(item)
-                    if pid_i:
-                        parsed["image_url"] = dom_images.get(pid_i)
-                        intercepted[pid_i]  = parsed
-                        print(
-                            f"     {pid_i}: '{parsed['name']}' | "
-                            f"{parsed['current_price']}€ "
-                            f"(-{parsed['discount_pct']}%) | "
-                            f"tallas: {parsed['sizes']}"
-                        )
-
-        elif missing and not api_headers:
+        elif missing and not captured_req:
             print(
-                "  -> AVISO: no se capturaron cabeceras de API. "
+                f"  -> AVISO: sin cabeceras capturadas. "
                 f"Los {len(missing)} productos sin datos pasarán filtros por defecto."
             )
 
@@ -358,7 +336,7 @@ def passes_filters(pid: str, details: dict) -> bool:
     discount_pct  = product.get("discount_pct")
     sizes         = product.get("sizes", [])
 
-    # ── Precio / descuento ────────────────────────────────────────────────────
+    # Precio / descuento
     if current_price is not None and discount_pct is not None:
         threshold = (
             DISCOUNT_BELOW_20 if current_price < PRICE_BREAKPOINT
@@ -374,7 +352,7 @@ def passes_filters(pid: str, details: dict) -> bool:
     else:
         print(f"  [FILTRO] {pid}: precio/dto no disponible → sin filtro de precio")
 
-    # ── Talla ─────────────────────────────────────────────────────────────────
+    # Talla
     if not sizes:
         print(f"  [FILTRO] {pid}: tallas no disponibles → incluido por defecto")
         return True
