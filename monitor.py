@@ -35,7 +35,6 @@ def _to_eur(value) -> float | None:
         return None
     try:
         v = float(value)
-        # Uniqlo a veces devuelve precios en céntimos (ej: 1999 → 19.99 €)
         return round(v / 100, 2) if v > 500 else round(v, 2)
     except (TypeError, ValueError):
         return None
@@ -127,20 +126,39 @@ def _parse_item(item: dict) -> tuple[str, dict]:
         "original_price": orig_price,
         "discount_pct":   disc,
         "sizes":          _parse_sizes(item),
-        "image_url":      None,   # se rellena después desde el DOM
+        "image_url":      None,
     }
 
 
 def fetch_ids_and_details(previous_ids: set[str]) -> dict:
-    # Diccionario compartido que el listener de red va rellenando durante el scroll
-    intercepted: dict = {}
+    intercepted: dict    = {}
+    api_headers: dict    = {}   # cabeceras capturadas de una llamada real al API
+    api_base_url: list   = []   # URL base del API (para reutilizar)
+
+    def on_request(request):
+        """Captura las cabeceras de las llamadas reales al API de productos."""
+        if (
+            "/api/commerce/v5/es/products" in request.url
+            and not api_headers                        # solo necesitamos una muestra
+        ):
+            # Guardamos todas las cabeceras de esa petición original
+            api_headers.update(dict(request.headers))
+            # Guardamos también la URL base (con el host correcto)
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(request.url)
+                api_base_url.append(
+                    f"{parsed.scheme}://{parsed.netloc}"
+                    f"/api/commerce/v5/es/products"
+                )
+            except Exception:
+                pass
 
     def on_response(response):
-        """Captura respuestas del API de productos que la página hace sola."""
+        """Captura los datos de producto de las respuestas paginadas."""
         try:
-            url = response.url
             if (
-                "/api/commerce/v5/es/products" in url
+                "/api/commerce/v5/es/products" in response.url
                 and response.status == 200
             ):
                 body  = response.json()
@@ -150,7 +168,7 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
                     if pid_i and pid_i not in intercepted:
                         intercepted[pid_i] = parsed
         except Exception:
-            pass   # silenciar errores de parseo en el listener
+            pass
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -170,8 +188,7 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
             viewport={"width": 1920, "height": 1080},
         )
         page = context.new_page()
-
-        # Activar el interceptor ANTES de cargar la página
+        page.on("request",  on_request)
         page.on("response", on_response)
 
         print("  -> Cargando home...")
@@ -195,8 +212,7 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
             page_height = page.evaluate("document.body.scrollHeight")
             print(
                 f"     Paso {i+1}: pos={current_pos}px / "
-                f"altura={page_height}px | "
-                f"interceptados={len(intercepted)}"
+                f"altura={page_height}px | interceptados={len(intercepted)}"
             )
             if current_pos >= page_height:
                 page.wait_for_timeout(3000)
@@ -205,7 +221,7 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
         else:
             print("  -> Límite de pasos alcanzado.")
 
-        print(f"  -> {len(intercepted)} productos con datos de red interceptados")
+        print(f"  -> {len(intercepted)} productos con datos interceptados por red")
 
         # ── Extracción DOM: IDs + URLs de imagen ──────────────────────────────
         print("  -> Extrayendo IDs e imágenes del DOM...")
@@ -228,24 +244,98 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
                 return { ids: Array.from(ids), images: images };
             }
         """)
-
-        current_ids  = dom_result["ids"]
-        dom_images   = dom_result["images"]
+        current_ids = dom_result["ids"]
+        dom_images  = dom_result["images"]
 
         if not current_ids:
             raise ValueError("No se encontró ningún producto en el DOM.")
 
-        # Adjuntar URLs de imagen a los datos interceptados
+        # Adjuntar imágenes del DOM a los datos ya interceptados
         for pid_d, img_src in dom_images.items():
             if pid_d in intercepted:
                 intercepted[pid_d]["image_url"] = img_src
 
-        print(f"  -> {len(current_ids)} productos únicos en oferta")
+        # ── Fetch complementario para productos sin datos ─────────────────────
+        missing = [pid for pid in current_ids if pid not in intercepted]
         print(
-            f"  -> {len(dom_images)} imágenes extraídas del DOM | "
-            f"cobertura de detalle: "
-            f"{len([p for p in current_ids if p in intercepted])}/{len(current_ids)}"
+            f"  -> {len(current_ids)} productos únicos en oferta | "
+            f"cobertura: {len(intercepted)}/{len(current_ids)} | "
+            f"sin datos: {len(missing)}"
         )
+
+        if missing and api_headers:
+            print(
+                f"  -> Consultando API con cabeceras capturadas "
+                f"para {len(missing)} productos sin datos..."
+            )
+            base_url  = (
+                api_base_url[0] if api_base_url
+                else "https://www.uniqlo.com/es/api/commerce/v5/es/products"
+            )
+            # Serializar cabeceras para pasarlas a JS (solo las relevantes)
+            safe_headers = {
+                k: v for k, v in api_headers.items()
+                if k.lower() not in (
+                    "content-length", "host", ":method", ":path",
+                    ":scheme", ":authority",
+                )
+            }
+            headers_json = json.dumps(safe_headers)
+            BATCH = 20
+
+            for start in range(0, len(missing), BATCH):
+                batch     = missing[start : start + BATCH]
+                ids_param = ",".join(batch)
+                api_url   = f"{base_url}?productIds={ids_param}"
+
+                api_resp = page.evaluate(f"""
+                    async () => {{
+                        try {{
+                            const headers = {headers_json};
+                            const r = await fetch('{api_url}', {{
+                                credentials: 'include',
+                                headers:     headers,
+                            }});
+                            const body = await r.json();
+                            return {{ status: r.status, body: body }};
+                        }} catch(e) {{
+                            return {{ status: 0, error: e.toString() }};
+                        }}
+                    }}
+                """)
+
+                status = api_resp.get("status", 0)
+                body   = api_resp.get("body", {})
+                print(f"     HTTP {status}")
+
+                if status != 200:
+                    raw = json.dumps(body, ensure_ascii=False)[:500]
+                    print(f"     Respuesta: {raw}")
+                    continue
+
+                items = _extract_items_from_body(body)
+                print(f"     Items recibidos: {len(items)}")
+
+                for item in items:
+                    pid_i, parsed = _parse_item(item)
+                    if pid_i:
+                        parsed["image_url"] = dom_images.get(pid_i)
+                        intercepted[pid_i]  = parsed
+                        print(
+                            f"     {pid_i}: '{parsed['name']}' | "
+                            f"{parsed['current_price']}€ "
+                            f"(-{parsed['discount_pct']}%) | "
+                            f"tallas: {parsed['sizes']}"
+                        )
+
+        elif missing and not api_headers:
+            print(
+                "  -> AVISO: no se capturaron cabeceras de API. "
+                f"Los {len(missing)} productos sin datos pasarán filtros por defecto."
+            )
+
+        final_covered = len([p for p in current_ids if p in intercepted])
+        print(f"  -> Cobertura final: {final_covered}/{len(current_ids)}")
 
         browser.close()
 
@@ -378,12 +468,10 @@ def send_email(filtered_ids: list[str], details: dict):
             f'<img src="{img}" width="100" height="130" alt="{name}"'
             f' style="display:block;border-radius:4px;'
             f'object-fit:cover;background:#f5f5f5;" /></a>'
-            if img
-            else (
-                f'<a href="{link}" style="display:block;width:100px;height:130px;'
-                f'background:#f0f0f0;border-radius:4px;text-align:center;'
-                f'line-height:130px;font-size:11px;color:#aaa;">sin imagen</a>'
-            )
+            if img else
+            f'<a href="{link}" style="display:block;width:100px;height:130px;'
+            f'background:#f0f0f0;border-radius:4px;text-align:center;'
+            f'line-height:130px;font-size:11px;color:#aaa;">sin imagen</a>'
         )
 
         cards_html += f"""
@@ -421,7 +509,6 @@ def send_email(filtered_ids: list[str], details: dict):
         <table width="620" cellpadding="0" cellspacing="0" align="center"
                style="background:#fff;border-radius:6px;
                       box-shadow:0 1px 4px rgba(0,0,0,.1);">
-
           <tr>
             <td style="background:#e60012;padding:22px 28px;
                        border-radius:6px 6px 0 0;">
@@ -433,7 +520,6 @@ def send_email(filtered_ids: list[str], details: dict):
               </div>
             </td>
           </tr>
-
           <tr>
             <td style="padding:8px 28px 16px;">
               <table width="100%" cellpadding="0" cellspacing="0">
@@ -441,7 +527,6 @@ def send_email(filtered_ids: list[str], details: dict):
               </table>
             </td>
           </tr>
-
           <tr>
             <td style="padding:0 28px 28px;text-align:center;">
               <a href="{URL}"
@@ -452,14 +537,12 @@ def send_email(filtered_ids: list[str], details: dict):
               </a>
             </td>
           </tr>
-
           <tr>
             <td style="border-top:1px solid #eee;padding:12px 28px;
                        text-align:center;font-size:11px;color:#bbb;">
               Uniqlo Monitor &middot; GitHub Actions
             </td>
           </tr>
-
         </table>
         </td></tr>
       </table>
