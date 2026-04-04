@@ -25,8 +25,29 @@ PRICE_BREAKPOINT     = 20.0  # €
 # ───────────────────────────────────────────────────────────────────────────────
 
 
+def _product_code_and_color(pid: str):
+    """'E455365-000' → ('455365', '000')"""
+    clean = pid.lstrip("E")
+    parts = clean.split("-")
+    code  = parts[0]
+    color = parts[1] if len(parts) > 1 else "000"
+    return code, color
+
+
+def image_url(pid: str) -> str:
+    code, color = _product_code_and_color(pid)
+    return (
+        f"https://image.uniqlo.com/UQ/ST3/eu/imagesgoods/"
+        f"{code}/item/eugoods_{code}_{color}.jpg"
+    )
+
+
+def product_url(pid: str) -> str:
+    short_id = "-".join(pid.split("-")[:2])
+    return f"https://www.uniqlo.com/es/es/products/{short_id}/00"
+
+
 def _to_eur(value) -> float | None:
-    """Convierte un valor numérico a euros (gestiona céntimos y euros directos)."""
     if value is None:
         return None
     try:
@@ -40,33 +61,91 @@ def _parse_price(price_obj) -> float | None:
     if isinstance(price_obj, (int, float)):
         return _to_eur(price_obj)
     if isinstance(price_obj, dict):
-        return _to_eur(price_obj.get("value") or price_obj.get("amount"))
+        for key in ("value", "amount", "price"):
+            if price_obj.get(key) is not None:
+                return _to_eur(price_obj[key])
     return None
 
 
-def fetch_ids_and_details(previous_ids: set[str]) -> dict:
-    """
-    Sesión única de Chromium:
-      1. Scrollea la página de ofertas y extrae todos los IDs del DOM.
-      2. Calcula new_ids = current_ids - previous_ids.
-      3. Si hay nuevos (y no es primera ejecución), llama al API de detalle
-         desde dentro del navegador para heredar la sesión Akamai.
+def _extract_items_from_body(body) -> list:
+    """Intenta todas las rutas conocidas de respuesta del API de Uniqlo."""
+    if isinstance(body, list):
+        return body
+    if isinstance(body, dict):
+        candidates = [
+            (body.get("result") or {}).get("items"),
+            body.get("items"),
+            body.get("products"),
+            body.get("data") if isinstance(body.get("data"), list) else None,
+            (body.get("data") or {}).get("items") if isinstance(body.get("data"), dict) else None,
+        ]
+        for c in candidates:
+            if c and isinstance(c, list):
+                return c
+    return []
 
-    Devuelve:
-        {
-          "product_ids": [str],        # todos los IDs actuales
-          "new_ids":     [str],        # IDs que no estaban en previous_ids
-          "details": {                 # solo para new_ids
-              pid: {
-                  "name":           str,
-                  "current_price":  float | None,
-                  "original_price": float | None,
-                  "discount_pct":   float | None,
-                  "sizes":          [str],
-              }
-          }
-        }
-    """
+
+def _parse_sizes(item: dict) -> list[str]:
+    avail = []
+    for key in ("sizes", "availableSizes", "skus", "variants"):
+        entries = item.get(key)
+        if not entries or not isinstance(entries, list):
+            continue
+        for s in entries:
+            if isinstance(s, str):
+                avail.append(s)
+            elif isinstance(s, dict):
+                stock_raw = s.get("stock") or s.get("stockStatus") or s.get("qty")
+                stock_str = str(stock_raw).upper() if stock_raw is not None else ""
+                if stock_str and any(
+                    bad in stock_str for bad in ("OUT", "SOLD", "NO")
+                ) or stock_str == "0":
+                    continue
+                sz_name = (
+                    s.get("name") or s.get("sizeName") or s.get("code")
+                    or s.get("displayCode") or s.get("label")
+                )
+                if sz_name:
+                    avail.append(str(sz_name))
+        if avail:
+            break
+    return avail
+
+
+def _parse_item(item: dict) -> tuple[str, dict]:
+    pid = (
+        item.get("productId") or item.get("id")
+        or item.get("code") or item.get("displayCode") or ""
+    )
+    name = item.get("name") or item.get("title") or pid
+
+    prices     = item.get("prices") or {}
+    orig_price = _parse_price(
+        prices.get("base") or prices.get("original") or prices.get("was")
+        or prices.get("regularPrice") or prices.get("listPrice")
+        or item.get("regularPrice") or item.get("originalPrice")
+    )
+    curr_price = _parse_price(
+        prices.get("promo") or prices.get("sale") or prices.get("now")
+        or prices.get("current") or prices.get("salePrice") or prices.get("finalPrice")
+        or item.get("price") or item.get("salePrice")
+    )
+    disc = (
+        round((1 - curr_price / orig_price) * 100, 1)
+        if orig_price and curr_price and orig_price > 0
+        else None
+    )
+
+    return pid, {
+        "name":           name,
+        "current_price":  curr_price,
+        "original_price": orig_price,
+        "discount_pct":   disc,
+        "sizes":          _parse_sizes(item),
+    }
+
+
+def fetch_ids_and_details(previous_ids: set[str]) -> dict:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -85,7 +164,6 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
         )
         page = context.new_page()
 
-        # ── Carga inicial ──────────────────────────────────────────────────────
         print("  -> Cargando home...")
         page.goto("https://www.uniqlo.com/es/es/", wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2000)
@@ -94,18 +172,12 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
         page.goto(URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(5000)
 
-        # ── Scroll incremental ─────────────────────────────────────────────────
         print("  -> Scrolleando para renderizar todos los productos...")
-        VIEWPORT_HEIGHT = 1080
-        STEP            = VIEWPORT_HEIGHT
-        PAUSE_MS        = 2500
-        MAX_STEPS       = 120
-        current_pos     = 0
-
-        for i in range(MAX_STEPS):
-            current_pos += STEP
+        current_pos = 0
+        for i in range(120):
+            current_pos += 1080
             page.evaluate(f"window.scrollTo(0, {current_pos})")
-            page.wait_for_timeout(PAUSE_MS)
+            page.wait_for_timeout(2500)
             page_height = page.evaluate("document.body.scrollHeight")
             print(f"     Paso {i+1}: pos={current_pos}px / altura={page_height}px")
             if current_pos >= page_height:
@@ -115,7 +187,6 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
         else:
             print("  -> Límite de pasos alcanzado.")
 
-        # ── Extracción DOM ─────────────────────────────────────────────────────
         print("  -> Extrayendo IDs del DOM...")
         dom_result = page.evaluate("""
             () => {
@@ -130,127 +201,88 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
                 return { ids: Array.from(ids), noMatch: Array.from(noMatch).slice(0, 30) };
             }
         """)
-
-        print(f"  -> {len(dom_result['ids'])} productos encontrados con regex actual")
-        if dom_result["noMatch"]:
-            print(f"  -> {len(dom_result['noMatch'])} links /products/ sin regex match:")
-            for href in dom_result["noMatch"]:
-                print(f"     {href}")
-
         current_ids = dom_result["ids"]
         if not current_ids:
             raise ValueError("No se encontró ningún producto en el DOM.")
+        print(f"  -> {len(current_ids)} productos únicos en oferta")
 
         new_ids = [pid for pid in current_ids if pid not in previous_ids]
         details: dict = {}
 
-        # ── API de detalle (solo si hay nuevos y no es primera ejecución) ──────
         if new_ids and previous_ids:
-            print(f"  -> Consultando API de detalle para {len(new_ids)} producto(s) nuevo(s)...")
-            BATCH_SIZE = 20
+            print(f"  -> Consultando API para {len(new_ids)} producto(s) nuevo(s)...")
+            BATCH_SIZE              = 20
+            price_group_candidates  = ["SPR", ""]
+
             for batch_start in range(0, len(new_ids), BATCH_SIZE):
                 batch     = new_ids[batch_start : batch_start + BATCH_SIZE]
                 ids_param = ",".join(batch)
+                got_items = False
 
-                api_response = page.evaluate(f"""
-                    async () => {{
-                        const url = 'https://www.uniqlo.com/es/api/commerce/v5/es/products'
-                                  + '?productIds={ids_param}&priceGroups=SPR';
-                        try {{
-                            const r = await fetch(url, {{ credentials: 'include' }});
-                            return {{ status: r.status, body: await r.json() }};
-                        }} catch (e) {{
-                            return {{ status: 0, error: e.toString() }};
+                for pg in price_group_candidates:
+                    pg_suffix = f"&priceGroups={pg}" if pg else ""
+                    api_url   = (
+                        f"https://www.uniqlo.com/es/api/commerce/v5/es/products"
+                        f"?productIds={ids_param}{pg_suffix}"
+                    )
+                    print(f"     Probando: {api_url[:120]}")
+
+                    api_response = page.evaluate(f"""
+                        async () => {{
+                            try {{
+                                const r    = await fetch('{api_url}', {{ credentials: 'include' }});
+                                const body = await r.json();
+                                return {{ status: r.status, body: body }};
+                            }} catch (e) {{
+                                return {{ status: 0, error: e.toString() }};
+                            }}
                         }}
-                    }}
-                """)
+                    """)
 
-                status = api_response.get("status", 0)
-                print(f"     API HTTP {status}")
+                    status = api_response.get("status", 0)
+                    body   = api_response.get("body", {})
+                    print(f"     HTTP {status}")
 
-                if status != 200:
-                    print(f"     Respuesta inesperada: {json.dumps(api_response)[:400]}")
-                    continue
+                    # ── LOG DE DIAGNÓSTICO (clave para la siguiente iteración) ──
+                    raw_preview = json.dumps(body, ensure_ascii=False)[:2000]
+                    print(f"     RAW RESPONSE: {raw_preview}")
+                    # ──────────────────────────────────────────────────────────
 
-                body  = api_response.get("body", {})
-                # Intentamos las rutas de respuesta más habituales de Uniqlo
-                items = (
-                    (body.get("result") or {}).get("items")
-                    or body.get("items")
-                    or body.get("data")
-                    or []
-                )
-                print(f"     {len(items)} item(s) recibidos del API")
-
-                for item in items:
-                    pid = item.get("productId") or item.get("id")
-                    if not pid:
+                    if status != 200:
                         continue
 
-                    # Precios
-                    prices     = item.get("prices") or {}
-                    orig_price = _parse_price(
-                        prices.get("base") or prices.get("original") or prices.get("was")
-                    )
-                    curr_price = _parse_price(
-                        prices.get("promo") or prices.get("sale")
-                        or prices.get("now")  or prices.get("current")
-                    )
-                    disc = (
-                        round((1 - curr_price / orig_price) * 100, 1)
-                        if orig_price and curr_price and orig_price > 0
-                        else None
-                    )
+                    items = _extract_items_from_body(body)
+                    print(f"     Items encontrados: {len(items)}")
 
-                    # Nombre
-                    name = (
-                        item.get("name") or item.get("title")
-                        or item.get("displayCode") or pid
-                    )
+                    if items:
+                        got_items = True
+                        for item in items:
+                            pid_item, parsed = _parse_item(item)
+                            if pid_item:
+                                details[pid_item] = parsed
+                                print(
+                                    f"     {pid_item}: '{parsed['name']}' | "
+                                    f"{parsed['current_price']}€ "
+                                    f"(-{parsed['discount_pct']}%) | "
+                                    f"tallas: {parsed['sizes']}"
+                                )
+                        break
 
-                    # Tallas con stock disponible
-                    sizes_raw   = item.get("sizes") or item.get("availableSizes") or []
-                    avail_sizes = []
-                    for s in sizes_raw:
-                        if isinstance(s, dict):
-                            stock = str(s.get("stock") or s.get("stockStatus") or "").upper()
-                            if stock and "OUT" not in stock and stock not in {"0", "SOLDOUT"}:
-                                sz_name = s.get("name") or s.get("code") or ""
-                                if sz_name:
-                                    avail_sizes.append(sz_name)
-                        elif isinstance(s, str) and s:
-                            avail_sizes.append(s)
-
-                    details[pid] = {
-                        "name":           name,
-                        "current_price":  curr_price,
-                        "original_price": orig_price,
-                        "discount_pct":   disc,
-                        "sizes":          avail_sizes,
-                    }
+                if not got_items:
                     print(
-                        f"     {pid}: {name!r} | "
-                        f"{curr_price}€ (-{disc}%) | "
-                        f"tallas: {avail_sizes}"
+                        "     AVISO: API no devolvió items para este batch. "
+                        "Los productos pasarán filtros por defecto (fail-open)."
                     )
 
         browser.close()
 
-    print(f"  -> Total: {len(current_ids)} productos únicos en oferta")
-    return {
-        "product_ids": current_ids,
-        "new_ids":     new_ids,
-        "details":     details,
-    }
+    return {"product_ids": current_ids, "new_ids": new_ids, "details": details}
 
 
 def passes_filters(pid: str, details: dict) -> bool:
-    """True si el producto supera todos los filtros configurados."""
     product = details.get(pid)
-
     if not product:
-        # Sin datos de detalle → incluir por seguridad (fail-open)
-        print(f"  [FILTRO] {pid}: sin datos de detalle → incluido por defecto")
+        print(f"  [FILTRO] {pid}: sin datos → incluido por defecto (fail-open)")
         return True
 
     name          = product.get("name", "")
@@ -258,23 +290,17 @@ def passes_filters(pid: str, details: dict) -> bool:
     discount_pct  = product.get("discount_pct")
     sizes         = product.get("sizes", [])
 
-    # ── Filtro precio / descuento ──────────────────────────────────────────────
+    # Precio / descuento
     if current_price is not None and discount_pct is not None:
-        threshold = (
-            DISCOUNT_BELOW_20 if current_price < PRICE_BREAKPOINT
-            else DISCOUNT_ABOVE_20
-        )
+        threshold = DISCOUNT_BELOW_20 if current_price < PRICE_BREAKPOINT else DISCOUNT_ABOVE_20
         if discount_pct < threshold:
-            print(
-                f"  [FILTRO] {pid} '{name}': "
-                f"{discount_pct:.1f}% dto < {threshold}% → EXCLUIDO"
-            )
+            print(f"  [FILTRO] {pid} '{name}': {discount_pct:.1f}% < {threshold}% → EXCLUIDO")
             return False
-        print(f"  [FILTRO] {pid} '{name}': {discount_pct:.1f}% dto ≥ {threshold}% → OK precio")
+        print(f"  [FILTRO] {pid}: {discount_pct:.1f}% ≥ {threshold}% → OK precio")
     else:
-        print(f"  [FILTRO] {pid} '{name}': precio/dto no disponible → sin filtro de precio")
+        print(f"  [FILTRO] {pid}: precio/dto no disponible → sin filtro de precio")
 
-    # ── Filtro de talla ────────────────────────────────────────────────────────
+    # Talla
     if not sizes:
         print(f"  [FILTRO] {pid}: tallas no disponibles → incluido por defecto")
         return True
@@ -282,27 +308,20 @@ def passes_filters(pid: str, details: dict) -> bool:
     sizes_set   = set(sizes)
     sizes_lower = {s.lower() for s in sizes}
 
-    # Talla única (en cualquier idioma)
     if sizes_lower & TALLA_UNICA_KEYWORDS:
         print(f"  [FILTRO] {pid}: talla única → incluido")
         return True
-
-    # M o L
     if sizes_set & SIZES_ALWAYS:
-        print(f"  [FILTRO] {pid}: M/L disponible → incluido")
+        print(f"  [FILTRO] {pid}: M/L → incluido")
         return True
-
-    # Cintura 30 / 31 / 32
     if sizes_set & SIZES_WAIST:
-        print(f"  [FILTRO] {pid}: cintura 30/31/32 disponible → incluido")
+        print(f"  [FILTRO] {pid}: cintura 30/31/32 → incluido")
         return True
-
-    # Oversize → S también es válida
     if "oversize" in name.lower() and "S" in sizes_set:
-        print(f"  [FILTRO] {pid}: '{name}' es Oversize + talla S → incluido")
+        print(f"  [FILTRO] {pid}: oversize + S → incluido")
         return True
 
-    print(f"  [FILTRO] {pid} '{name}': tallas {sizes} no coinciden → EXCLUIDO")
+    print(f"  [FILTRO] {pid}: tallas {sizes} no coinciden → EXCLUIDO")
     return False
 
 
@@ -321,72 +340,139 @@ def save_state(ids: list[str]):
 
 
 def send_email(filtered_ids: list[str], details: dict):
-    now              = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
-    product_url_base = "https://www.uniqlo.com/es/es/products"
+    now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
 
-    items_html = ""
+    cards_html = ""
     for pid in filtered_ids:
-        short_id     = "-".join(pid.split("-")[:2])
-        product_link = f"{product_url_base}/{short_id}/00"
-        info         = details.get(pid, {})
-
-        name  = info.get("name", pid)
+        info  = details.get(pid, {})
+        name  = info.get("name") or pid
         curr  = info.get("current_price")
         orig  = info.get("original_price")
         disc  = info.get("discount_pct")
         sizes = info.get("sizes", [])
+        img   = image_url(pid)
+        link  = product_url(pid)
 
-        if curr is not None and orig is not None and disc is not None:
+        badge = (
+            f'<span style="background:#e60012;color:#fff;padding:3px 8px;'
+            f'border-radius:3px;font-size:12px;font-weight:bold;'
+            f'display:inline-block;margin-bottom:6px;">−{disc:.0f}%</span>'
+            if disc is not None else ""
+        )
+
+        if curr is not None and orig is not None:
             price_html = (
-                f'<span style="color:#999;text-decoration:line-through;">{orig:.2f}€</span>'
-                f'&nbsp;→&nbsp;'
-                f'<strong style="color:#e60012;font-size:16px;">{curr:.2f}€</strong>'
-                f'&nbsp;<span style="background:#e60012;color:#fff;padding:2px 7px;'
-                f'border-radius:3px;font-size:12px;font-weight:bold;">−{disc:.0f}%</span>'
+                f'<span style="color:#999;text-decoration:line-through;'
+                f'font-size:13px;">{orig:.2f}€</span>&nbsp;→&nbsp;'
+                f'<strong style="color:#e60012;font-size:18px;">{curr:.2f}€</strong>'
             )
         elif curr is not None:
-            price_html = f'<strong>{curr:.2f}€</strong>'
+            price_html = f'<strong style="font-size:18px;">{curr:.2f}€</strong>'
         else:
-            price_html = '<span style="color:#aaa;">precio no disponible</span>'
-
-        sizes_html = ""
-        if sizes:
-            sizes_html = (
-                f'<div style="margin-top:4px;color:#555;font-size:13px;">'
-                f'Tallas disponibles: {", ".join(sizes)}</div>'
+            price_html = (
+                '<span style="color:#aaa;font-size:13px;">Consultar precio en web</span>'
             )
 
-        items_html += f"""
-        <li style="margin-bottom:18px;list-style:none;
-                   border-left:3px solid #e60012;padding-left:14px;">
-          <a href="{product_link}"
-             style="font-size:15px;color:#111;text-decoration:none;
-                    font-weight:bold;display:block;margin-bottom:5px;">{name}</a>
-          <div style="margin-bottom:2px;">{price_html}</div>
-          {sizes_html}
-          <span style="font-size:10px;color:#ccc;">{pid}</span>
-        </li>"""
+        if sizes:
+            chips = "".join(
+                f'<span style="display:inline-block;border:1px solid #ccc;'
+                f'border-radius:3px;padding:1px 7px;margin:2px 2px 0 0;'
+                f'font-size:12px;">{s}</span>'
+                for s in sizes
+            )
+            sizes_html = (
+                f'<div style="margin-top:8px;color:#555;font-size:12px;">'
+                f'Tallas disponibles:</div>'
+                f'<div style="margin-top:4px;">{chips}</div>'
+            )
+        else:
+            sizes_html = ""
+
+        cards_html += f"""
+        <tr>
+          <td style="padding:16px 0;border-bottom:1px solid #eee;">
+            <table width="100%" cellpadding="0" cellspacing="0"><tr>
+              <td width="110" valign="top" style="padding-right:16px;">
+                <a href="{link}">
+                  <img src="{img}" width="100" height="130"
+                       style="display:block;border-radius:4px;
+                              object-fit:cover;background:#f5f5f5;"
+                       onerror="this.style.display='none'" />
+                </a>
+              </td>
+              <td valign="top">
+                {badge}
+                <div style="margin-bottom:6px;">
+                  <a href="{link}" style="font-size:15px;color:#111;
+                     text-decoration:none;font-weight:bold;
+                     line-height:1.3;">{name}</a>
+                </div>
+                <div style="margin-bottom:4px;">{price_html}</div>
+                {sizes_html}
+                <div style="margin-top:10px;">
+                  <a href="{link}" style="font-size:12px;color:#e60012;
+                     text-decoration:none;">Ver producto →</a>
+                </div>
+              </td>
+            </tr></table>
+          </td>
+        </tr>"""
 
     html_body = f"""
-    <html><body style="font-family:Arial,sans-serif;max-width:620px;margin:auto;color:#333;">
-      <h2 style="color:#e60012;border-bottom:2px solid #e60012;padding-bottom:10px;">
-        Uniqlo &mdash; {len(filtered_ids)} artículo(s) nuevo(s) en ofertas
-      </h2>
-      <p style="color:#666;margin-top:0;">Detectado el <strong>{now}</strong></p>
-      <ul style="padding:0;margin:0;">{items_html}</ul>
-      <p style="margin-top:28px;">
-        <a href="{URL}"
-           style="background:#e60012;color:#fff;padding:12px 24px;
-                  text-decoration:none;border-radius:4px;font-weight:bold;
-                  display:inline-block;">
-          Ver sección de ofertas &rarr;
-        </a>
-      </p>
-      <hr style="margin-top:36px;border:none;border-top:1px solid #eee;"/>
-      <p style="font-size:11px;color:#bbb;margin:8px 0;">
-        Uniqlo Monitor &middot; GitHub Actions
-      </p>
-    </body></html>
+    <html>
+    <body style="margin:0;padding:0;background:#f4f4f4;
+                 font-family:Arial,Helvetica,sans-serif;">
+      <table width="100%" cellpadding="0" cellspacing="0"
+             style="background:#f4f4f4;padding:24px 0;">
+        <tr><td>
+        <table width="620" cellpadding="0" cellspacing="0"
+               align="center"
+               style="background:#fff;border-radius:6px;
+                      box-shadow:0 1px 4px rgba(0,0,0,.1);">
+
+          <tr>
+            <td style="background:#e60012;padding:22px 28px;
+                       border-radius:6px 6px 0 0;">
+              <div style="color:#fff;font-size:20px;font-weight:bold;">
+                Uniqlo &mdash; {len(filtered_ids)} artículo(s) nuevo(s)
+              </div>
+              <div style="color:#ffbbbb;font-size:12px;margin-top:4px;">
+                Detectado el {now}
+              </div>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:8px 28px 16px;">
+              <table width="100%" cellpadding="0" cellspacing="0">
+                {cards_html}
+              </table>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:0 28px 28px;text-align:center;">
+              <a href="{URL}"
+                 style="display:inline-block;background:#e60012;color:#fff;
+                        padding:13px 30px;text-decoration:none;border-radius:4px;
+                        font-weight:bold;font-size:15px;">
+                Ver todas las ofertas →
+              </a>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="border-top:1px solid #eee;padding:12px 28px;
+                       text-align:center;font-size:11px;color:#bbb;">
+              Uniqlo Monitor &middot; GitHub Actions
+            </td>
+          </tr>
+
+        </table>
+        </td></tr>
+      </table>
+    </body>
+    </html>
     """
 
     msg            = MIMEMultipart("alternative")
@@ -407,11 +493,10 @@ def main():
     print(f"[{now}] Comprobando ofertas...")
 
     previous_ids = load_state()
-
-    result      = fetch_ids_and_details(previous_ids)
-    current_ids = result["product_ids"]
-    new_ids     = result["new_ids"]
-    details     = result["details"]
+    result       = fetch_ids_and_details(previous_ids)
+    current_ids  = result["product_ids"]
+    new_ids      = result["new_ids"]
+    details      = result["details"]
 
     print(f"  -> {len(current_ids)} artículos detectados en total")
 
@@ -431,12 +516,12 @@ def main():
     filtered_ids = [pid for pid in new_ids if passes_filters(pid, details)]
 
     if filtered_ids:
-        print(f"  -> {len(filtered_ids)} artículo(s) superan los filtros → enviando email")
+        print(f"  -> {len(filtered_ids)} artículo(s) pasan los filtros → enviando email")
         send_email(filtered_ids, details)
     else:
         print(
-            f"  -> {len(new_ids)} nuevo(s) detectado(s), "
-            f"pero ninguno supera los filtros. No se envía email."
+            f"  -> {len(new_ids)} nuevo(s), ninguno pasa los filtros. "
+            f"No se envía email."
         )
 
     save_state(current_ids)
