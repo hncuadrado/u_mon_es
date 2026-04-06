@@ -132,16 +132,14 @@ def _parse_item(item: dict) -> tuple[str, dict]:
 
 def fetch_ids_and_details(previous_ids: set[str]) -> dict:
     intercepted: dict  = {}
-    captured_req: dict = {}   # una muestra de cabeceras + URL completa de API
+    captured_req: dict = {}
 
     def on_request(request):
-        """Guarda cabeceras y URL de la primera llamada al API de productos."""
         if "/api/commerce/v5/es/products" in request.url and not captured_req:
             captured_req["url"]     = request.url
             captured_req["headers"] = dict(request.headers)
 
     def on_response(response):
-        """Captura datos de producto de las respuestas paginadas."""
         try:
             if (
                 "/api/commerce/v5/es/products" in response.url
@@ -240,7 +238,6 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
         if not current_ids:
             raise ValueError("No se encontró ningún producto en el DOM.")
 
-        # Adjuntar imágenes del DOM a los datos ya interceptados
         for pid_d, img_src in dom_images.items():
             if pid_d in intercepted:
                 intercepted[pid_d]["image_url"] = img_src
@@ -252,15 +249,13 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
             f"sin datos: {len(missing)}"
         )
 
-        # ── Fetch complementario via context.request (hereda cookies, sin CORS) ─
+        # ── Fetch complementario via context.request ───────────────────────────
         if missing and captured_req:
-            # Construir cabeceras seguras (sin pseudo-cabeceras HTTP/2)
             safe_headers = {
                 k: v for k, v in captured_req["headers"].items()
                 if not k.startswith(":")
                 and k.lower() not in ("content-length", "host")
             }
-            # Extraer la base URL del endpoint (sin query string)
             raw_url  = captured_req["url"]
             base_url = raw_url.split("?")[0]
 
@@ -285,7 +280,6 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
                         body  = resp.json()
                         items = _extract_items_from_body(body)
                         print(f"     Items recibidos: {len(items)}")
-                        # Log de diagnóstico por si la estructura es diferente
                         if not items:
                             raw = json.dumps(body, ensure_ascii=False)[:800]
                             print(f"     RAW (sin items): {raw}")
@@ -325,6 +319,10 @@ def fetch_ids_and_details(previous_ids: set[str]) -> dict:
     }
 
 
+def _discount_threshold(price: float) -> float:
+    return DISCOUNT_BELOW_20 if price < PRICE_BREAKPOINT else DISCOUNT_ABOVE_20
+
+
 def passes_filters(pid: str, details: dict) -> bool:
     product = details.get(pid)
     if not product:
@@ -338,10 +336,7 @@ def passes_filters(pid: str, details: dict) -> bool:
 
     # Precio / descuento
     if current_price is not None and discount_pct is not None:
-        threshold = (
-            DISCOUNT_BELOW_20 if current_price < PRICE_BREAKPOINT
-            else DISCOUNT_ABOVE_20
-        )
+        threshold = _discount_threshold(current_price)
         if discount_pct < threshold:
             print(
                 f"  [FILTRO] {pid} '{name}': "
@@ -377,82 +372,170 @@ def passes_filters(pid: str, details: dict) -> bool:
     return False
 
 
-def load_state() -> set[str]:
+def find_price_drops(
+    current_ids: list[str],
+    previous_ids: set[str],
+    previous_prices: dict,
+    details: dict,
+) -> list[str]:
+    """
+    Devuelve los IDs de productos ya conocidos cuyo descuento ha cruzado
+    el umbral hacia arriba respecto al estado guardado.
+    Solo se incluyen si además pasan el filtro de tallas.
+    """
+    drops = []
+    # Solo productos que estaban Y siguen estando (no nuevos, no desaparecidos)
+    existing = [pid for pid in current_ids if pid in previous_ids]
+
+    for pid in existing:
+        product = details.get(pid)
+        if not product:
+            continue
+
+        curr_price   = product.get("current_price")
+        curr_disc    = product.get("discount_pct")
+
+        # Sin datos de precio actuales → no podemos comparar
+        if curr_price is None or curr_disc is None:
+            continue
+
+        threshold = _discount_threshold(curr_price)
+
+        # El descuento actual no supera el umbral → no notificar
+        if curr_disc < threshold:
+            continue
+
+        # Recuperar descuento anterior guardado en state.json
+        prev_data  = previous_prices.get(pid, {})
+        prev_disc  = prev_data.get("discount")   # puede ser None si no había dato
+
+        # Si el descuento anterior ya superaba el umbral → ya lo notificamos antes
+        if prev_disc is not None and prev_disc >= threshold:
+            continue
+
+        # El descuento cruzó el umbral (o antes era None y ahora sí pasa)
+        # Comprobamos también el filtro de tallas
+        if not passes_filters(pid, details):
+            continue
+
+        prev_str = f"{prev_disc:.1f}%" if prev_disc is not None else "sin dato"
+        print(
+            f"  [BAJADA] {pid} '{product.get('name', '')}': "
+            f"{prev_str} → {curr_disc:.1f}% (umbral {threshold}%) → NOTIFICAR"
+        )
+        drops.append(pid)
+
+    return drops
+
+
+def load_state() -> tuple[set[str], dict]:
+    """
+    Devuelve (previous_ids, previous_prices).
+    previous_prices: {pid: {"price": float|None, "discount": float|None}}
+    """
     if not os.path.exists(STATE_FILE):
-        return set()
+        return set(), {}
     with open(STATE_FILE) as f:
         data = json.load(f)
-    return set(data.get("product_ids", []))
+    ids    = set(data.get("product_ids", []))
+    prices = data.get("product_prices", {})
+    return ids, prices
 
 
-def save_state(ids: list[str]):
+def save_state(ids: list[str], details: dict):
+    """Guarda IDs y precios/descuentos actuales en state.json."""
     now = datetime.now(timezone.utc).isoformat()
+    product_prices = {}
+    for pid in ids:
+        product = details.get(pid, {})
+        product_prices[pid] = {
+            "price":    product.get("current_price"),
+            "discount": product.get("discount_pct"),
+        }
     with open(STATE_FILE, "w") as f:
-        json.dump({"product_ids": ids, "last_updated": now}, f, indent=2)
+        json.dump(
+            {
+                "product_ids":    ids,
+                "product_prices": product_prices,
+                "last_updated":   now,
+            },
+            f,
+            indent=2,
+        )
 
 
-def send_email(filtered_ids: list[str], details: dict):
-    now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+def _build_card(pid: str, details: dict, label: str = "") -> str:
+    """Genera el HTML de una tarjeta de producto para el email."""
+    info  = details.get(pid, {})
+    name  = info.get("name") or pid
+    curr  = info.get("current_price")
+    orig  = info.get("original_price")
+    disc  = info.get("discount_pct")
+    sizes = info.get("sizes", [])
+    img   = info.get("image_url") or ""
+    link  = product_url(pid)
 
-    cards_html = ""
-    for pid in filtered_ids:
-        info  = details.get(pid, {})
-        name  = info.get("name") or pid
-        curr  = info.get("current_price")
-        orig  = info.get("original_price")
-        disc  = info.get("discount_pct")
-        sizes = info.get("sizes", [])
-        img   = info.get("image_url") or ""
-        link  = product_url(pid)
-
-        badge = (
+    # Badge de descuento (más etiqueta opcional "BAJADA DE PRECIO")
+    badge_parts = []
+    if disc is not None:
+        badge_parts.append(
             f'<span style="background:#e60012;color:#fff;padding:3px 8px;'
-            f'border-radius:3px;font-size:12px;font-weight:bold;'
-            f'display:inline-block;margin-bottom:6px;">−{disc:.0f}%</span>'
-            if disc is not None else ""
+            f'border-radius:3px;font-size:12px;font-weight:bold;">'
+            f'−{disc:.0f}%</span>'
+        )
+    if label:
+        badge_parts.append(
+            f'<span style="background:#ff8c00;color:#fff;padding:3px 8px;'
+            f'border-radius:3px;font-size:11px;font-weight:bold;'
+            f'margin-left:4px;">{label}</span>'
+        )
+    badge = (
+        f'<div style="margin-bottom:6px;">'
+        + " ".join(badge_parts)
+        + "</div>"
+        if badge_parts else ""
+    )
+
+    if curr is not None and orig is not None:
+        price_html = (
+            f'<span style="color:#999;text-decoration:line-through;'
+            f'font-size:13px;">{orig:.2f}€</span>&nbsp;→&nbsp;'
+            f'<strong style="color:#e60012;font-size:18px;">{curr:.2f}€</strong>'
+        )
+    elif curr is not None:
+        price_html = f'<strong style="font-size:18px;">{curr:.2f}€</strong>'
+    else:
+        price_html = (
+            '<span style="color:#aaa;font-size:13px;">Consultar precio en web</span>'
         )
 
-        if curr is not None and orig is not None:
-            price_html = (
-                f'<span style="color:#999;text-decoration:line-through;'
-                f'font-size:13px;">{orig:.2f}€</span>&nbsp;→&nbsp;'
-                f'<strong style="color:#e60012;font-size:18px;">{curr:.2f}€</strong>'
-            )
-        elif curr is not None:
-            price_html = f'<strong style="font-size:18px;">{curr:.2f}€</strong>'
-        else:
-            price_html = (
-                '<span style="color:#aaa;font-size:13px;">'
-                'Consultar precio en web</span>'
-            )
-
-        if sizes:
-            chips = "".join(
-                f'<span style="display:inline-block;border:1px solid #ccc;'
-                f'border-radius:3px;padding:1px 7px;margin:2px 2px 0 0;'
-                f'font-size:12px;">{s}</span>'
-                for s in sizes
-            )
-            sizes_html = (
-                f'<div style="margin-top:8px;color:#555;font-size:12px;">'
-                f'Tallas disponibles:</div>'
-                f'<div style="margin-top:4px;">{chips}</div>'
-            )
-        else:
-            sizes_html = ""
-
-        img_block = (
-            f'<a href="{link}">'
-            f'<img src="{img}" width="100" height="130" alt="{name}"'
-            f' style="display:block;border-radius:4px;'
-            f'object-fit:cover;background:#f5f5f5;" /></a>'
-            if img else
-            f'<a href="{link}" style="display:block;width:100px;height:130px;'
-            f'background:#f0f0f0;border-radius:4px;text-align:center;'
-            f'line-height:130px;font-size:11px;color:#aaa;">sin imagen</a>'
+    if sizes:
+        chips = "".join(
+            f'<span style="display:inline-block;border:1px solid #ccc;'
+            f'border-radius:3px;padding:1px 7px;margin:2px 2px 0 0;'
+            f'font-size:12px;">{s}</span>'
+            for s in sizes
         )
+        sizes_html = (
+            f'<div style="margin-top:8px;color:#555;font-size:12px;">'
+            f'Tallas disponibles:</div>'
+            f'<div style="margin-top:4px;">{chips}</div>'
+        )
+    else:
+        sizes_html = ""
 
-        cards_html += f"""
+    img_block = (
+        f'<a href="{link}">'
+        f'<img src="{img}" width="100" height="130" alt="{name}"'
+        f' style="display:block;border-radius:4px;object-fit:cover;'
+        f'background:#f5f5f5;" /></a>'
+        if img else
+        f'<a href="{link}" style="display:block;width:100px;height:130px;'
+        f'background:#f0f0f0;border-radius:4px;text-align:center;'
+        f'line-height:130px;font-size:11px;color:#aaa;">sin imagen</a>'
+    )
+
+    return f"""
         <tr>
           <td style="padding:16px 0;border-bottom:1px solid #eee;">
             <table width="100%" cellpadding="0" cellspacing="0"><tr>
@@ -477,6 +560,51 @@ def send_email(filtered_ids: list[str], details: dict):
           </td>
         </tr>"""
 
+
+def _section_header(title: str) -> str:
+    return (
+        f'<tr><td style="padding:20px 0 4px;">'
+        f'<div style="font-size:13px;font-weight:bold;color:#888;'
+        f'text-transform:uppercase;letter-spacing:1px;'
+        f'border-bottom:2px solid #eee;padding-bottom:6px;">'
+        f'{title}</div></td></tr>'
+    )
+
+
+def send_email(new_ids: list[str], price_drop_ids: list[str], details: dict):
+    now        = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+    total      = len(new_ids) + len(price_drop_ids)
+    cards_html = ""
+
+    if new_ids:
+        cards_html += _section_header(
+            f"{'Artículos nuevos' if len(new_ids) > 1 else 'Artículo nuevo'} "
+            f"({len(new_ids)})"
+        )
+        for pid in new_ids:
+            cards_html += _build_card(pid, details)
+
+    if price_drop_ids:
+        cards_html += _section_header(
+            f"{'Bajadas de precio' if len(price_drop_ids) > 1 else 'Bajada de precio'} "
+            f"({len(price_drop_ids)})"
+        )
+        for pid in price_drop_ids:
+            cards_html += _build_card(pid, details, label="↓ PRECIO")
+
+    # Asunto del email
+    parts = []
+    if new_ids:
+        parts.append(
+            f"{len(new_ids)} nuevo{'s' if len(new_ids) > 1 else ''}"
+        )
+    if price_drop_ids:
+        parts.append(
+            f"{len(price_drop_ids)} bajada{'s' if len(price_drop_ids) > 1 else ''} "
+            f"de precio"
+        )
+    subject = "Uniqlo ofertas: " + " · ".join(parts)
+
     html_body = f"""
     <html>
     <body style="margin:0;padding:0;background:#f4f4f4;
@@ -491,7 +619,7 @@ def send_email(filtered_ids: list[str], details: dict):
             <td style="background:#e60012;padding:22px 28px;
                        border-radius:6px 6px 0 0;">
               <div style="color:#fff;font-size:20px;font-weight:bold;">
-                Uniqlo &mdash; {len(filtered_ids)} artículo(s) nuevo(s)
+                Uniqlo &mdash; {total} artículo(s) de interés
               </div>
               <div style="color:#ffbbbb;font-size:12px;margin-top:4px;">
                 Detectado el {now}
@@ -529,7 +657,7 @@ def send_email(filtered_ids: list[str], details: dict):
     """
 
     msg            = MIMEMultipart("alternative")
-    msg["Subject"] = f"Uniqlo ofertas: {len(filtered_ids)} artículo(s) nuevo(s)"
+    msg["Subject"] = subject
     msg["From"]    = GMAIL_USER
     msg["To"]      = NOTIFY_EMAIL
     msg.attach(MIMEText(html_body, "html"))
@@ -538,46 +666,46 @@ def send_email(filtered_ids: list[str], details: dict):
         server.login(GMAIL_USER, GMAIL_PASS)
         server.sendmail(GMAIL_USER, NOTIFY_EMAIL, msg.as_string())
 
-    print(f"  -> Email enviado con {len(filtered_ids)} artículo(s)")
+    print(f"  -> Email enviado: {len(new_ids)} nuevo(s), "
+          f"{len(price_drop_ids)} bajada(s) de precio")
 
 
 def main():
     now = datetime.now(timezone.utc).isoformat()
     print(f"[{now}] Comprobando ofertas...")
 
-    previous_ids = load_state()
-    result       = fetch_ids_and_details(previous_ids)
-    current_ids  = result["product_ids"]
-    new_ids      = result["new_ids"]
-    details      = result["details"]
+    previous_ids, previous_prices = load_state()
+    result      = fetch_ids_and_details(previous_ids)
+    current_ids = result["product_ids"]
+    new_ids     = result["new_ids"]
+    details     = result["details"]
 
     print(f"  -> {len(current_ids)} artículos detectados en total")
 
     if not previous_ids:
-        save_state(current_ids)
+        save_state(current_ids, details)
         print("  -> Primera ejecución. Estado guardado. No se envía email.")
         return
 
-    if not new_ids:
-        print("  -> Sin cambios.")
-        save_state(current_ids)
-        return
+    # ── Artículos nuevos ──────────────────────────────────────────────────────
+    print(f"  -> {len(new_ids)} artículo(s) nuevo(s) detectado(s)")
+    filtered_new = [pid for pid in new_ids if passes_filters(pid, details)]
 
-    print(f"  -> {len(new_ids)} artículo(s) NUEVO(S): {new_ids}")
-    print("  -> Aplicando filtros...")
+    # ── Bajadas de precio en artículos ya conocidos ───────────────────────────
+    print("  -> Comprobando bajadas de precio en artículos existentes...")
+    price_drops = find_price_drops(current_ids, previous_ids, previous_prices, details)
 
-    filtered_ids = [pid for pid in new_ids if passes_filters(pid, details)]
-
-    if filtered_ids:
-        print(f"  -> {len(filtered_ids)} artículo(s) pasan filtros → enviando email")
-        send_email(filtered_ids, details)
-    else:
+    # ── Envío ─────────────────────────────────────────────────────────────────
+    if filtered_new or price_drops:
         print(
-            f"  -> {len(new_ids)} nuevo(s), ninguno pasa los filtros. "
-            f"No se envía email."
+            f"  -> {len(filtered_new)} nuevo(s) + "
+            f"{len(price_drops)} bajada(s) de precio → enviando email"
         )
+        send_email(filtered_new, price_drops, details)
+    else:
+        print("  -> Sin novedades que notificar.")
 
-    save_state(current_ids)
+    save_state(current_ids, details)
 
 
 if __name__ == "__main__":
