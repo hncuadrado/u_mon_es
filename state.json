@@ -17,7 +17,6 @@
     "E465185-000",
     "E455365-000",
     "E485454-000",
-    "E484203-000",
     "E485455-000",
     "E461001-000",
     "E475376-000",
@@ -122,30 +121,26 @@
       "discount": 78.5
     },
     "E471808-000": {
-      "price": null,
-      "discount": null
+      "price": 29.9,
+      "discount": 25.1
     },
     "E484398-000": {
       "price": 39.9,
       "discount": 20.0
     },
     "E482758-000": {
-      "price": null,
-      "discount": null
+      "price": 19.9,
+      "discount": 33.4
     },
     "E465185-000": {
-      "price": null,
-      "discount": null
+      "price": 9.9,
+      "discount": 50.3
     },
     "E455365-000": {
-      "price": null,
-      "discount": null
+      "price": 9.9,
+      "discount": 50.3
     },
     "E485454-000": {
-      "price": 12.9,
-      "discount": 35.2
-    },
-    "E484203-000": {
       "price": 12.9,
       "discount": 35.2
     },
@@ -154,16 +149,16 @@
       "discount": 35.2
     },
     "E461001-000": {
-      "price": null,
-      "discount": null
+      "price": 5.9,
+      "discount": 60.4
     },
     "E475376-000": {
       "price": 5.9,
       "discount": 25.3
     },
     "E461011-000": {
-      "price": null,
-      "discount": null
+      "price": 9.9,
+      "discount": 66.9
     },
     "E484663-001": {
       "price": 39.9,
@@ -206,12 +201,12 @@
       "discount": 60.3
     },
     "E450535-000": {
-      "price": null,
-      "discount": null
+      "price": 29.9,
+      "discount": 25.1
     },
     "E450543-000": {
-      "price": null,
-      "discount": null
+      "price": 39.9,
+      "discount": 60.1
     },
     "E450544-000": {
       "price": 89.9,
@@ -222,12 +217,12 @@
       "discount": 50.1
     },
     "E456630-000": {
-      "price": null,
-      "discount": null
+      "price": 24.9,
+      "discount": 28.7
     },
     "E462369-000": {
-      "price": null,
-      "discount": null
+      "price": 24.9,
+      "discount": 28.7
     },
     "E484246-000": {
       "price": 14.9,
@@ -378,5 +373,5 @@
       "discount": 28.7
     }
   },
-  "last_updated": "2026-05-17T07:34:42.225519+00:00"
+  "last_updated": "2026-05-17T09:23:27.382418+00:00"
 }
