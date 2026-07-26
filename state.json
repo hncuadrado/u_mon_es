@@ -127,7 +127,6 @@
     "E476997-000",
     "E485612-000",
     "E460939-000",
-    "E478003-000",
     "E484249-000",
     "E483819-000",
     "E478270-000",
@@ -241,20 +240,20 @@
       "discount": 28.7
     },
     "E450179-000": {
-      "price": 1.9,
-      "discount": 90.5
+      "price": 3.9,
+      "discount": 80.4
     },
     "E475053-000": {
-      "price": 29.9,
-      "discount": 25.1
+      "price": null,
+      "discount": null
     },
     "E475380-000": {
       "price": 29.9,
       "discount": 25.1
     },
     "E485735-000": {
-      "price": 29.9,
-      "discount": 40.1
+      "price": null,
+      "discount": null
     },
     "E483975-000": {
       "price": 12.9,
@@ -265,12 +264,12 @@
       "discount": 28.7
     },
     "E479620-000": {
-      "price": 19.9,
-      "discount": 33.4
+      "price": null,
+      "discount": null
     },
     "E471809-000": {
-      "price": 19.9,
-      "discount": 50.1
+      "price": null,
+      "discount": null
     },
     "E458036-000": {
       "price": 24.9,
@@ -668,10 +667,6 @@
       "price": 7.9,
       "discount": 80.2
     },
-    "E478003-000": {
-      "price": 19.9,
-      "discount": 50.1
-    },
     "E484249-000": {
       "price": 29.9,
       "discount": 50.1
@@ -793,5 +788,5 @@
       "discount": 87.2
     }
   },
-  "last_updated": "2026-07-26T07:35:18.618675+00:00"
+  "last_updated": "2026-07-26T09:38:51.826474+00:00"
 }
